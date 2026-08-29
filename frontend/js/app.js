@@ -370,6 +370,12 @@ function resetAppState() {
   $('url-volume').value = '1'
   $('screen-video').volume = 1
   $('url-video').volume = 1
+  // 重置缩放模式
+  $('screen-video').classList.remove('object-fit-fill')
+  $('url-video').classList.remove('object-fit-fill')
+  // 重置播放按钮
+  const playBtn = document.querySelector('.toolbar-btn[data-action="play-pause"][data-target="screen-video"]')
+  if (playBtn) playBtn.textContent = '▶'
   // 重置聊天
   $('chat-messages').innerHTML = ''
 }
@@ -404,6 +410,74 @@ function init() {
   // 侧栏标签页切换
   $('tab-chat').addEventListener('click', () => switchSidebarTab('chat'))
   $('tab-members').addEventListener('click', () => switchSidebarTab('members'))
+
+  // 视频工具栏 — 播放/暂停、全屏、画中画、缩放模式
+  document.querySelectorAll('.toolbar-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.action
+      const video = $(btn.dataset.target)
+      if (!video) return
+
+      switch (action) {
+        case 'play-pause':
+          if (video.paused) {
+            video.play()
+            btn.textContent = '⏸'
+          } else {
+            video.pause()
+            btn.textContent = '▶'
+          }
+          break
+
+        case 'fullscreen':
+          if (document.fullscreenElement) {
+            document.exitFullscreen()
+          } else {
+            const container = video.closest('.video-container')
+            if (container.requestFullscreen) {
+              container.requestFullscreen()
+            } else if (container.webkitRequestFullscreen) {
+              container.webkitRequestFullscreen()
+            }
+          }
+          break
+
+        case 'pip':
+          if (document.pictureInPictureElement) {
+            document.exitPictureInPicture()
+          } else if (video !== document.pictureInPictureElement) {
+            if (video.requestPictureInPicture) {
+              video.requestPictureInPicture().catch(() => {
+                showToast('当前浏览器不支持画中画')
+              })
+            } else {
+              showToast('当前浏览器不支持画中画')
+            }
+          }
+          break
+
+        case 'fit':
+          if (video.classList.contains('object-fit-fill')) {
+            video.classList.remove('object-fit-fill')
+            showToast('缩放模式：适应窗口')
+          } else {
+            video.classList.add('object-fit-fill')
+            showToast('缩放模式：填满窗口')
+          }
+          break
+      }
+    })
+  })
+
+  // 播放/暂停按钮状态同步
+  $('screen-video').addEventListener('play', () => {
+    const btn = document.querySelector('.toolbar-btn[data-action="play-pause"][data-target="screen-video"]')
+    if (btn) btn.textContent = '⏸'
+  })
+  $('screen-video').addEventListener('pause', () => {
+    const btn = document.querySelector('.toolbar-btn[data-action="play-pause"][data-target="screen-video"]')
+    if (btn) btn.textContent = '▶'
+  })
 
   // 音量控制
   $('screen-volume').addEventListener('input', (e) => {

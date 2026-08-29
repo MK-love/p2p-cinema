@@ -51,6 +51,12 @@
           <div id="screen-placeholder" class="video-placeholder">
             <p>等待屏幕共享...</p>
           </div>
+          <div class="video-toolbar">
+            <button class="toolbar-btn" data-action="play-pause" data-target="screen-video" title="播放/暂停">▶</button>
+            <button class="toolbar-btn" data-action="pip" data-target="screen-video" title="画中画">⧉</button>
+            <button class="toolbar-btn" data-action="fit" data-target="screen-video" title="缩放模式">⤢</button>
+            <button class="toolbar-btn" data-action="fullscreen" data-target="screen-video" title="全屏">⛶</button>
+          </div>
         </div>
         <div class="controls">
           <button id="btn-share-screen" class="btn btn-primary">开始共享屏幕</button>
@@ -72,6 +78,11 @@
           <video id="url-video" controls playsinline></video>
           <div id="url-placeholder" class="video-placeholder">
             <p>输入视频 URL 开始观影</p>
+          </div>
+          <div class="video-toolbar">
+            <button class="toolbar-btn" data-action="pip" data-target="url-video" title="画中画">⧉</button>
+            <button class="toolbar-btn" data-action="fit" data-target="url-video" title="缩放模式">⤢</button>
+            <button class="toolbar-btn" data-action="fullscreen" data-target="url-video" title="全屏">⛶</button>
           </div>
         </div>
         <div class="controls">
