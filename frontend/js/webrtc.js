@@ -88,30 +88,7 @@ export class WebRTCClient {
       video: { frameRate: 30 },
       audio: true
     })
-
-    // 画质优化：设置编码参数
-    const sender = this.localStream.getVideoTracks()[0]
-      ? this.connections.size > 0
-        ? this._getVideoSender()
-        : null
-      : null
-
     return this.localStream
-  }
-
-  _getVideoSender() {
-    for (const pc of this.connections.values()) {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video')
-      if (sender) {
-        const params = sender.getParameters()
-        if (!params.encodings) params.encodings = [{}]
-        params.encodings[0].maxBitrate = 2500000 // 2.5 Mbps
-        params.degradationPreference = 'maintain-framerate'
-        sender.setParameters(params)
-        return sender
-      }
-    }
-    return null
   }
 
   stopScreenShare() {
@@ -164,6 +141,15 @@ export class WebRTCClient {
         pc.addTrack(track, stream)
       }
     })
+    // 画质优化：设置视频编码参数
+    const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video')
+    if (videoSender) {
+      const params = videoSender.getParameters()
+      if (!params.encodings) params.encodings = [{}]
+      params.encodings[0].maxBitrate = 2500000
+      params.degradationPreference = 'maintain-framerate'
+      videoSender.setParameters(params)
+    }
   }
 
   async renegotiate(remotePeerId) {

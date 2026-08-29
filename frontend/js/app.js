@@ -107,12 +107,7 @@ function setupWebRTC(webrtc) {
   })
 
   webrtc.onDataMessage((data, remotePeerId) => {
-    if (data.type === 'join') {
-      // 房主收到加入者通知，发起连接
-      if (app.isHost) {
-        webrtc.initiateConnection(remotePeerId)
-      }
-    }
+    // DataChannel 消息由 SyncController 处理，这里不需要额外逻辑
   })
 
   webrtc.onConnected((remotePeerId) => {
