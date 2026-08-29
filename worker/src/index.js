@@ -23,8 +23,9 @@ function generateRoomCode() {
 }
 
 async function handleRoom(request, env, method, pathParts) {
+  // pathParts = ['api', 'room', code?] — .filter(Boolean) 后无空字符串前缀
   // POST /api/room — 创建房间
-  if (method === 'POST' && pathParts[2] === 'room' && !pathParts[3]) {
+  if (method === 'POST' && pathParts[1] === 'room' && !pathParts[2]) {
     const body = await request.json()
     const roomCode = generateRoomCode()
     const room = {
@@ -38,8 +39,8 @@ async function handleRoom(request, env, method, pathParts) {
   }
 
   // GET /api/room/:code — 查询房间
-  if (method === 'GET' && pathParts[2] === 'room' && pathParts[3]) {
-    const code = pathParts[3]
+  if (method === 'GET' && pathParts[1] === 'room' && pathParts[2]) {
+    const code = pathParts[2]
     const data = await env.ROOMS.get(code)
     if (!data) return jsonResponse({ error: 'Room not found or expired' }, 404)
     const room = JSON.parse(data)
@@ -47,8 +48,8 @@ async function handleRoom(request, env, method, pathParts) {
   }
 
   // DELETE /api/room/:code — 删除房间
-  if (method === 'DELETE' && pathParts[2] === 'room' && pathParts[3]) {
-    const code = pathParts[3]
+  if (method === 'DELETE' && pathParts[1] === 'room' && pathParts[2]) {
+    const code = pathParts[2]
     await env.ROOMS.delete(code)
     await env.SIGNALS.delete(code)
     return jsonResponse({ ok: true })
