@@ -1,0 +1,120 @@
+// test/worker/index.test.js
+
+import { describe, it, expect, beforeEach } from 'vitest'
+import worker from '../../worker/src/index.js'
+
+function createMockKV() {
+  const store = new Map()
+  return {
+    get: async (key) => store.get(key) || null,
+    put: async (key, value, options) => {
+      store.set(key, value)
+    },
+    delete: async (key) => { store.delete(key) },
+    list: async () => ({ keys: Array.from(store.keys()).map(name => ({ name })) })
+  }
+}
+
+function createEnv() {
+  return { ROOMS: createMockKV(), SIGNALS: createMockKV() }
+}
+
+function jsonRequest(method, path, body) {
+  return new Request(`http://localhost${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  })
+}
+
+describe('Worker API', () => {
+  let env
+  beforeEach(() => { env = createEnv() })
+
+  describe('CORS', () => {
+    it('returns CORS headers on OPTIONS', async () => {
+      const res = await worker.fetch(new Request('http://localhost/api/room', { method: 'OPTIONS' }), env)
+      expect(res.status).toBe(204)
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*')
+    })
+
+    it('returns CORS headers on all responses', async () => {
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*')
+    })
+  })
+
+  describe('POST /api/room', () => {
+    it('creates a room and returns roomCode + peerId', async () => {
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      expect(res.status).toBe(201)
+      const data = await res.json()
+      expect(data.roomCode).toHaveLength(6)
+      expect(data.peerId).toBe('host-123')
+    })
+  })
+
+  describe('GET /api/room/:code', () => {
+    it('returns room info for valid code', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(new Request(`http://localhost/api/room/${roomCode}`), env)
+      expect(res.status).toBe(200)
+      const data = await res.json()
+      expect(data.hostId).toBe('host-123')
+    })
+
+    it('returns 404 for invalid code', async () => {
+      const res = await worker.fetch(new Request('http://localhost/api/room/INVALID'), env)
+      expect(res.status).toBe(404)
+    })
+  })
+
+  describe('POST /api/signal/:code', () => {
+    it('stores a signal message', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(jsonRequest('POST', `/api/signal/${roomCode}`, {
+        from: 'host-123', to: 'guest-456', type: 'offer', data: 'sdp-data'
+      }), env)
+      expect(res.status).toBe(200)
+      const data = await res.json()
+      expect(data.ok).toBe(true)
+    })
+
+    it('returns 404 for non-existent room', async () => {
+      const res = await worker.fetch(jsonRequest('POST', '/api/signal/INVALID', {
+        from: 'a', to: 'b', type: 'offer', data: 'x'
+      }), env)
+      expect(res.status).toBe(404)
+    })
+  })
+
+  describe('GET /api/signal/:code', () => {
+    it('returns messages since timestamp', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      await worker.fetch(jsonRequest('POST', `/api/signal/${roomCode}`, {
+        from: 'host-123', to: 'guest-456', type: 'offer', data: 'sdp-data'
+      }), env)
+      const res = await worker.fetch(new Request(`http://localhost/api/signal/${roomCode}?since=0`), env)
+      expect(res.status).toBe(200)
+      const data = await res.json()
+      expect(data.messages).toHaveLength(1)
+      expect(data.messages[0].type).toBe('offer')
+    })
+  })
+
+  describe('DELETE /api/room/:code', () => {
+    it('deletes the room', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(jsonRequest('DELETE', `/api/room/${roomCode}`, { peerId: 'host-123' }), env)
+      expect(res.status).toBe(200)
+      const data = await res.json()
+      expect(data.ok).toBe(true)
+      const getRes = await worker.fetch(new Request(`http://localhost/api/room/${roomCode}`), env)
+      expect(getRes.status).toBe(404)
+    })
+  })
+})

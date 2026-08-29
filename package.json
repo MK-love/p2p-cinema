@@ -1,0 +1,13 @@
+{
+  "name": "p2p-cinema",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:worker": "wrangler dev --config worker/wrangler.toml"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0"
+  }
+}
