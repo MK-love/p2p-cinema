@@ -23,9 +23,13 @@ export class SyncController {
     this.syncTimer = null
     this.chatCallbacks = []
     this.loadUrlCallbacks = []
+    this.profileCallbacks = []
+    this.participantsCallbacks = []
+    this.roomDissolvedCallbacks = []
+    this.peerLeftCallbacks = []
 
     this.webrtc.onDataMessage((data, remotePeerId) => {
-      this.handleDataMessage(data)
+      this.handleDataMessage(data, remotePeerId)
     })
   }
 
@@ -53,17 +57,70 @@ export class SyncController {
     }
   }
 
-  // I5: 加入者收到 load 时通知 UI 隐藏 placeholder
   onLoadUrl(callback) {
     this.loadUrlCallbacks.push(callback)
   }
 
-  handleDataMessage(data) {
+  // --- 房间事件消息 ---
+
+  sendProfile(nickname, peerId) {
+    this.webrtc.sendData(formatSyncMessage('profile', { nickname, peerId }))
+  }
+
+  broadcastParticipants(list) {
+    this.webrtc.sendData(formatSyncMessage('participants', { list }))
+  }
+
+  sendPeerLeft(peerId) {
+    this.webrtc.sendData(formatSyncMessage('peer-left', { peerId }))
+  }
+
+  sendRoomDissolved() {
+    this.webrtc.sendData(formatSyncMessage('room-dissolved', {}))
+  }
+
+  onProfile(callback) {
+    this.profileCallbacks.push(callback)
+  }
+
+  onParticipantsUpdate(callback) {
+    this.participantsCallbacks.push(callback)
+  }
+
+  onRoomDissolved(callback) {
+    this.roomDissolvedCallbacks.push(callback)
+  }
+
+  onPeerLeft(callback) {
+    this.peerLeftCallbacks.push(callback)
+  }
+
+  // --- 消息路由 ---
+
+  handleDataMessage(data, remotePeerId) {
+    // 聊天消息 — 所有角色都处理
     if (data.type === 'chat') {
       this.chatCallbacks.forEach(cb => cb(data))
       return
     }
 
+    // 房间事件 — 所有角色都处理
+    switch (data.type) {
+      case 'room-dissolved':
+        this.roomDissolvedCallbacks.forEach(cb => cb())
+        return
+      case 'peer-left':
+        this.peerLeftCallbacks.forEach(cb => cb(data.peerId))
+        return
+      case 'participants':
+        this.participantsCallbacks.forEach(cb => cb(data.list))
+        return
+      case 'profile':
+        this.profileCallbacks.forEach(cb => cb(data.nickname, data.peerId))
+        return
+    }
+
+    // 同步播放 — 仅加入者跟随房主
     if (this.isHost) return
 
     switch (data.type) {

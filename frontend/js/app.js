@@ -13,13 +13,15 @@ const API_BASE = window.location.hostname === 'localhost'
 const app = {
   state: 'home',
   peerId: null,
+  nickname: null,
   roomCode: null,
   isHost: false,
   roomClient: null,
   signalClient: null,
   webrtcClient: null,
   syncController: null,
-  currentMode: 'screen'
+  currentMode: 'screen',
+  participants: []
 }
 
 // 工具函数
@@ -36,14 +38,31 @@ function generatePeerId() {
   return 'peer-' + Math.random().toString(36).slice(2, 11)
 }
 
+function generateNickname() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  let suffix = ''
+  for (let i = 0; i < 4; i++) {
+    suffix += chars[Math.floor(Math.random() * chars.length)]
+  }
+  return '用户-' + suffix
+}
+
 function showPage(page) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'))
   $(`${page}-page`).classList.add('active')
 }
 
+function switchSidebarTab(tab) {
+  document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'))
+  document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'))
+  $(`tab-${tab}`).classList.add('active')
+  $(`${tab}-panel`).classList.add('active')
+}
+
 // 创建房间
 async function handleCreateRoom() {
   app.peerId = generatePeerId()
+  app.nickname = $('input-nickname').value.trim() || generateNickname()
   app.isHost = true
   app.roomClient = new RoomClient(API_BASE)
   try {
@@ -67,6 +86,7 @@ async function handleJoinRoom() {
     return
   }
   app.peerId = generatePeerId()
+  app.nickname = $('input-nickname').value.trim() || generateNickname()
   app.isHost = false
   app.roomClient = new RoomClient(API_BASE)
   try {
@@ -76,7 +96,6 @@ async function handleJoinRoom() {
     app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, false)
     setupWebRTC(app.webrtcClient)
     app.signalClient.start()
-    // I1: await send
     await app.signalClient.send(room.hostId, 'join', app.peerId)
     enterRoom()
   } catch (e) {
@@ -89,6 +108,15 @@ function enterRoom() {
   app.state = 'room'
   showPage('room')
   $('room-code-display').textContent = app.roomCode
+  $('btn-leave').textContent = app.isHost ? '解散房间' : '退出房间'
+
+  // 初始化参与者列表（自己）
+  app.participants = [{ peerId: app.peerId, nickname: app.nickname, isHost: app.isHost }]
+  renderParticipants()
+
+  // 重置 UI
+  $('chat-messages').innerHTML = ''
+  switchSidebarTab('chat')
 
   const video = $('url-video')
   app.syncController = new SyncController(video, app.webrtcClient, app.isHost)
@@ -96,10 +124,40 @@ function enterRoom() {
   app.syncController.onChat((data) => {
     appendChatMessage(data.from, data.text)
   })
-  // I5: 加入者收到 load 时隐藏 placeholder
   app.syncController.onLoadUrl(() => {
     $('url-placeholder').style.display = 'none'
     $('url-video').style.display = 'block'
+  })
+
+  // 房间事件回调
+  app.syncController.onProfile((nickname, peerId) => {
+    if (!app.isHost) return
+    app.participants = app.participants.filter(p => p.peerId !== peerId)
+    app.participants.push({ peerId, nickname, isHost: false })
+    app.syncController.broadcastParticipants(app.participants)
+    renderParticipants()
+  })
+
+  app.syncController.onParticipantsUpdate((list) => {
+    app.participants = list
+    renderParticipants()
+  })
+
+  app.syncController.onPeerLeft((peerId) => {
+    if (!app.isHost) return
+    const left = app.participants.find(p => p.peerId === peerId)
+    app.participants = app.participants.filter(p => p.peerId !== peerId)
+    app.syncController.broadcastParticipants(app.participants)
+    renderParticipants()
+    showToast(`${left?.nickname || peerId} 已退出房间`)
+  })
+
+  app.syncController.onRoomDissolved(() => {
+    if (app.webrtcClient) app.webrtcClient.close()
+    if (app.signalClient) app.signalClient.stop()
+    if (app.syncController) app.syncController.destroy()
+    resetAppState()
+    showToast('房主已解散房间')
   })
 }
 
@@ -111,8 +169,6 @@ function setupWebRTC(webrtc) {
     $('screen-placeholder').style.display = 'none'
   })
 
-  // M2: 删除空 onDataMessage 回调，DataChannel 消息由 SyncController 处理
-
   webrtc.onConnected((remotePeerId) => {
     updateParticipantCount()
     showToast(`已连接: ${remotePeerId}`)
@@ -123,7 +179,6 @@ function setupWebRTC(webrtc) {
     showToast(`${remotePeerId} 已断开`)
   })
 
-  // I10: 重连时重启信令轮询
   webrtc.onReconnect((remotePeerId, attempt) => {
     if (app.signalClient) {
       app.signalClient.reset()
@@ -131,8 +186,11 @@ function setupWebRTC(webrtc) {
     showToast(`正在重连 ${remotePeerId} (第${attempt}次)...`)
   })
 
-  // I9: DataChannel 就绪通知
+  // DataChannel 就绪 — 加入者发送昵称给房主
   webrtc.onDataChannelOpen((remotePeerId) => {
+    if (!app.isHost && app.syncController) {
+      app.syncController.sendProfile(app.nickname, app.peerId)
+    }
     showToast('数据通道已就绪')
   })
 
@@ -160,7 +218,6 @@ function setupWebRTC(webrtc) {
     showToast('信令超时，请重试')
   })
 
-  // I1: 信令发送错误通知
   app.signalClient.onError((e) => {
     console.error('Signal error:', e.message)
   })
@@ -176,12 +233,10 @@ async function handleShareScreen() {
     $('btn-share-screen').style.display = 'none'
     $('btn-stop-screen').style.display = 'inline-block'
 
-    // 监听屏幕共享停止
     stream.getVideoTracks()[0].onended = () => {
       handleStopScreen()
     }
 
-    // 向已连接的对端添加流并重新协商
     app.webrtcClient.connections.forEach((pc, remotePeerId) => {
       app.webrtcClient.addStreamToConnection(remotePeerId, stream)
       app.webrtcClient.renegotiate(remotePeerId)
@@ -221,17 +276,17 @@ function switchMode(mode) {
   $(`${mode}-mode`).classList.add('active')
 }
 
-// 聊天
+// 聊天 — 使用昵称显示
 function handleSendChat() {
   const input = $('input-chat')
   const text = input.value.trim()
   if (!text) return
-  app.syncController.sendChat(text, app.peerId)
-  appendChatMessage(app.peerId, text)
+  app.syncController.sendChat(text, app.nickname || app.peerId)
+  appendChatMessage(app.nickname || app.peerId, text)
   input.value = ''
 }
 
-// C1: XSS 修复 — 使用 textContent 代替 innerHTML
+// XSS 修复 — 使用 textContent
 function appendChatMessage(from, text) {
   const messages = $('chat-messages')
   const div = document.createElement('div')
@@ -245,21 +300,78 @@ function appendChatMessage(from, text) {
   messages.scrollTop = messages.scrollHeight
 }
 
-// 离开房间
+// 参与者列表渲染
+function renderParticipants() {
+  const list = $('members-list')
+  list.innerHTML = ''
+  app.participants.forEach(p => {
+    const div = document.createElement('div')
+    div.className = 'member-item'
+    const name = document.createElement('span')
+    name.className = 'member-name'
+    name.textContent = p.nickname
+    const badge = document.createElement('span')
+    badge.className = `member-badge ${p.isHost ? 'host' : 'member'}`
+    badge.textContent = p.isHost ? '房主' : '成员'
+    div.appendChild(name)
+    div.appendChild(badge)
+    list.appendChild(div)
+  })
+}
+
+// 离开/解散房间（按角色分流）
 async function handleLeaveRoom() {
-  if (app.webrtcClient) app.webrtcClient.close()
-  if (app.signalClient) app.signalClient.stop()
-  if (app.syncController) app.syncController.destroy()
-  if (app.roomClient && app.roomCode) {
-    try { await app.roomClient.leaveRoom(app.roomCode, app.peerId) } catch {}
+  if (app.isHost) {
+    // 房主解散房间：通知所有对端
+    if (app.syncController) {
+      app.syncController.sendRoomDissolved()
+    }
+    // 等待消息发出再关闭连接
+    await new Promise(r => setTimeout(r, 300))
+    if (app.webrtcClient) app.webrtcClient.close()
+    if (app.signalClient) app.signalClient.stop()
+    if (app.syncController) app.syncController.destroy()
+    if (app.roomClient && app.roomCode) {
+      try { await app.roomClient.leaveRoom(app.roomCode, app.peerId) } catch {}
+    }
+    resetAppState()
+    showToast('房间已解散')
+  } else {
+    // 加入者退出房间：通知房主
+    if (app.syncController) {
+      app.syncController.sendPeerLeft(app.peerId)
+    }
+    await new Promise(r => setTimeout(r, 300))
+    if (app.webrtcClient) app.webrtcClient.close()
+    if (app.signalClient) app.signalClient.stop()
+    if (app.syncController) app.syncController.destroy()
+    resetAppState()
   }
+}
+
+function resetAppState() {
   app.state = 'home'
   app.roomCode = null
   app.webrtcClient = null
   app.signalClient = null
   app.syncController = null
+  app.participants = []
   showPage('home')
   $('input-room-code').value = ''
+  // 重置视频元素
+  $('screen-video').srcObject = null
+  $('url-video').src = ''
+  $('screen-placeholder').style.display = 'block'
+  $('url-placeholder').style.display = 'block'
+  $('btn-share-screen').style.display = 'inline-block'
+  $('btn-stop-screen').style.display = 'none'
+  // 重置音量
+  $('screen-volume').value = '1'
+  $('url-volume').value = '1'
+  $('screen-video').volume = 1
+  $('url-video').volume = 1
+  // 重置聊天
+  $('chat-messages').innerHTML = ''
 }
 
 function updateParticipantCount() {
@@ -289,12 +401,43 @@ function init() {
     if (e.key === 'Enter') handleSendChat()
   })
 
-  // I3: 使用 keepalive 确保页面卸载前请求发出
+  // 侧栏标签页切换
+  $('tab-chat').addEventListener('click', () => switchSidebarTab('chat'))
+  $('tab-members').addEventListener('click', () => switchSidebarTab('members'))
+
+  // 音量控制
+  $('screen-volume').addEventListener('input', (e) => {
+    $('screen-video').volume = parseFloat(e.target.value)
+  })
+  $('url-volume').addEventListener('input', (e) => {
+    $('url-video').volume = parseFloat(e.target.value)
+  })
+
+  // 音量图标点击 — 静音/取消静音
+  document.querySelectorAll('.volume-icon').forEach((icon, index) => {
+    icon.addEventListener('click', () => {
+      const slider = index === 0 ? $('screen-volume') : $('url-volume')
+      const video = index === 0 ? $('screen-video') : $('url-video')
+      if (video.volume > 0) {
+        video.dataset.prevVolume = video.volume
+        video.volume = 0
+        slider.value = '0'
+        icon.textContent = '🔇'
+      } else {
+        const prev = parseFloat(video.dataset.prevVolume || '1')
+        video.volume = prev
+        slider.value = String(prev)
+        icon.textContent = '🔊'
+      }
+    })
+  })
+
+  // beforeunload 清理 — 仅房主删除房间
   window.addEventListener('beforeunload', () => {
     if (app.state === 'room') {
       if (app.webrtcClient) app.webrtcClient.close()
       if (app.signalClient) app.signalClient.stop()
-      if (app.roomClient && app.roomCode) {
+      if (app.isHost && app.roomClient && app.roomCode) {
         fetch(`${API_BASE}/api/room/${app.roomCode}`, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },

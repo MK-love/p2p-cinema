@@ -13,6 +13,7 @@
       <h1>🎬 P2P Cinema</h1>
       <p class="subtitle">和好友一起在线观影</p>
       <div class="home-actions">
+        <input type="text" id="input-nickname" placeholder="输入昵称（可选）" maxlength="20" autocomplete="off">
         <button id="btn-create" class="btn btn-primary">创建房间</button>
         <div class="divider">或</div>
         <div class="join-box">
@@ -54,6 +55,10 @@
         <div class="controls">
           <button id="btn-share-screen" class="btn btn-primary">开始共享屏幕</button>
           <button id="btn-stop-screen" class="btn btn-danger" style="display:none;">停止共享</button>
+          <div class="volume-control">
+            <span class="volume-icon">🔊</span>
+            <input type="range" id="screen-volume" class="volume-slider" min="0" max="1" step="0.05" value="1">
+          </div>
         </div>
       </div>
 
@@ -69,16 +74,30 @@
             <p>输入视频 URL 开始观影</p>
           </div>
         </div>
+        <div class="controls">
+          <div class="volume-control">
+            <span class="volume-icon">🔊</span>
+            <input type="range" id="url-volume" class="volume-slider" min="0" max="1" step="0.05" value="1">
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- 聊天侧栏 -->
+    <!-- 聊天/成员侧栏 -->
     <aside class="chat-sidebar">
-      <div class="chat-header">聊天</div>
-      <div id="chat-messages" class="chat-messages"></div>
-      <div class="chat-input-box">
-        <input type="text" id="input-chat" placeholder="输入消息..." autocomplete="off">
-        <button id="btn-send-chat" class="btn btn-small">发送</button>
+      <div class="sidebar-tabs">
+        <button id="tab-chat" class="sidebar-tab active">聊天</button>
+        <button id="tab-members" class="sidebar-tab">成员</button>
+      </div>
+      <div id="chat-panel" class="sidebar-panel active">
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="chat-input-box">
+          <input type="text" id="input-chat" placeholder="输入消息..." autocomplete="off">
+          <button id="btn-send-chat" class="btn btn-small">发送</button>
+        </div>
+      </div>
+      <div id="members-panel" class="sidebar-panel">
+        <div id="members-list" class="members-list"></div>
       </div>
     </aside>
   </div>
