@@ -2,6 +2,10 @@ name = "p2p-cinema-api"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# 部署前替换为真实 KV Namespace ID
+# 创建方式: Cloudflare Dashboard → Workers & Pages → KV → Create Namespace
+# 创建两个 namespace: p2p-cinema-rooms 和 p2p-cinema-signals
+# 然后将下方 id 替换为各自的 namespace ID
 [[kv_namespaces]]
 binding = "ROOMS"
 id = "your-kv-namespace-id"

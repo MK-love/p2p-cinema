@@ -6,6 +6,10 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type'
 }
 
+const MAX_SIGNAL_MESSAGES = 100
+const ROOM_TTL = 3600
+const SIGNAL_TTL = 600
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -22,19 +26,32 @@ function generateRoomCode() {
   return code
 }
 
+function validatePeerId(peerId) {
+  return typeof peerId === 'string' && peerId.length > 0 && peerId.length <= 100
+}
+
 async function handleRoom(request, env, method, pathParts) {
   // pathParts = ['api', 'room', code?] — .filter(Boolean) 后无空字符串前缀
   // POST /api/room — 创建房间
   if (method === 'POST' && pathParts[1] === 'room' && !pathParts[2]) {
     const body = await request.json()
-    const roomCode = generateRoomCode()
+    if (!validatePeerId(body.peerId)) {
+      return jsonResponse({ error: 'Invalid peerId' }, 400)
+    }
+    // C2: 检查房间码碰撞，最多重试 5 次
+    let roomCode
+    for (let i = 0; i < 5; i++) {
+      roomCode = generateRoomCode()
+      const existing = await env.ROOMS.get(roomCode)
+      if (!existing) break
+    }
     const room = {
       hostId: body.peerId,
       createdAt: Date.now(),
       participants: [body.peerId]
     }
-    await env.ROOMS.put(roomCode, JSON.stringify(room), { expirationTtl: 3600 })
-    await env.SIGNALS.put(roomCode, JSON.stringify([]), { expirationTtl: 300 })
+    await env.ROOMS.put(roomCode, JSON.stringify(room), { expirationTtl: ROOM_TTL })
+    await env.SIGNALS.put(roomCode, JSON.stringify([]), { expirationTtl: SIGNAL_TTL })
     return jsonResponse({ roomCode, peerId: body.peerId }, 201)
   }
 
@@ -47,9 +64,19 @@ async function handleRoom(request, env, method, pathParts) {
     return jsonResponse({ hostId: room.hostId, participants: room.participants })
   }
 
-  // DELETE /api/room/:code — 删除房间
+  // DELETE /api/room/:code — 删除房间（C3: 仅房主可删除）
   if (method === 'DELETE' && pathParts[1] === 'room' && pathParts[2]) {
     const code = pathParts[2]
+    const data = await env.ROOMS.get(code)
+    if (!data) return jsonResponse({ error: 'Room not found or expired' }, 404)
+    const room = JSON.parse(data)
+    const body = await request.json()
+    if (!validatePeerId(body.peerId)) {
+      return jsonResponse({ error: 'Invalid peerId' }, 400)
+    }
+    if (body.peerId !== room.hostId) {
+      return jsonResponse({ error: 'Only host can delete room' }, 403)
+    }
     await env.ROOMS.delete(code)
     await env.SIGNALS.delete(code)
     return jsonResponse({ ok: true })
@@ -75,7 +102,11 @@ async function handleSignal(request, env, method, code) {
       data: body.data,
       ts: Date.now()
     })
-    await env.SIGNALS.put(code, JSON.stringify(signals), { expirationTtl: 300 })
+    // I4: 限制消息数量，防止无限增长
+    if (signals.length > MAX_SIGNAL_MESSAGES) {
+      signals.splice(0, signals.length - MAX_SIGNAL_MESSAGES)
+    }
+    await env.SIGNALS.put(code, JSON.stringify(signals), { expirationTtl: SIGNAL_TTL })
     return jsonResponse({ ok: true })
   }
 

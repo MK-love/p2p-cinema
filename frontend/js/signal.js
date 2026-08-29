@@ -14,6 +14,7 @@ export class SignalClient {
     this.startTime = 0
     this.messageCallbacks = []
     this.timeoutCallbacks = []
+    this.errorCallbacks = []
   }
 
   onMessage(callback) {
@@ -24,12 +25,24 @@ export class SignalClient {
     this.timeoutCallbacks.push(callback)
   }
 
+  onError(callback) {
+    this.errorCallbacks.push(callback)
+  }
+
+  // I1: 内部 try/catch，错误通过 onError 回调上报
   async send(to, type, data) {
-    await fetch(`${this.apiBase}/api/signal/${this.roomCode}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: this.peerId, to, type, data })
-    })
+    try {
+      const res = await fetch(`${this.apiBase}/api/signal/${this.roomCode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: this.peerId, to, type, data })
+      })
+      if (!res.ok) {
+        this.errorCallbacks.forEach(cb => cb(new Error(`Signal send failed: ${res.status}`)))
+      }
+    } catch (e) {
+      this.errorCallbacks.forEach(cb => cb(e))
+    }
   }
 
   start() {
@@ -38,12 +51,25 @@ export class SignalClient {
     this.poll()
   }
 
+  // I10: 重连时重置超时计时器，恢复轮询
+  reset() {
+    this.startTime = Date.now()
+    this.running = true
+    if (!this.timerId) {
+      this.poll()
+    }
+  }
+
+  // I2: 停止时清空回调，防止重复注册
   stop() {
     this.running = false
     if (this.timerId) {
       clearTimeout(this.timerId)
       this.timerId = null
     }
+    this.messageCallbacks = []
+    this.timeoutCallbacks = []
+    this.errorCallbacks = []
   }
 
   async poll() {

@@ -25,6 +25,7 @@ jobs:
         with:
           node-version: '20'
       - run: npm ci
+      - run: npm test
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3
         with:

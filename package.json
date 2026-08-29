@@ -8,6 +8,7 @@
     "dev:worker": "wrangler dev --config worker/wrangler.toml"
   },
   "devDependencies": {
-    "vitest": "^2.0.0"
+    "vitest": "^4.0.0",
+    "wrangler": "^4.127.1"
   }
 }

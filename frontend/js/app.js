@@ -33,7 +33,7 @@ function showToast(message, duration = 3000) {
 }
 
 function generatePeerId() {
-  return 'peer-' + Math.random().toString(36).substr(2, 9)
+  return 'peer-' + Math.random().toString(36).slice(2, 11)
 }
 
 function showPage(page) {
@@ -76,8 +76,8 @@ async function handleJoinRoom() {
     app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, false)
     setupWebRTC(app.webrtcClient)
     app.signalClient.start()
-    // 加入者向房主发送 join 通知，房主收到后发起 WebRTC offer
-    app.signalClient.send(room.hostId, 'join', app.peerId)
+    // I1: await send
+    await app.signalClient.send(room.hostId, 'join', app.peerId)
     enterRoom()
   } catch (e) {
     showToast(e.message)
@@ -96,6 +96,11 @@ function enterRoom() {
   app.syncController.onChat((data) => {
     appendChatMessage(data.from, data.text)
   })
+  // I5: 加入者收到 load 时隐藏 placeholder
+  app.syncController.onLoadUrl(() => {
+    $('url-placeholder').style.display = 'none'
+    $('url-video').style.display = 'block'
+  })
 }
 
 // WebRTC 设置
@@ -106,9 +111,7 @@ function setupWebRTC(webrtc) {
     $('screen-placeholder').style.display = 'none'
   })
 
-  webrtc.onDataMessage((data, remotePeerId) => {
-    // DataChannel 消息由 SyncController 处理，这里不需要额外逻辑
-  })
+  // M2: 删除空 onDataMessage 回调，DataChannel 消息由 SyncController 处理
 
   webrtc.onConnected((remotePeerId) => {
     updateParticipantCount()
@@ -118,6 +121,19 @@ function setupWebRTC(webrtc) {
   webrtc.onDisconnected((remotePeerId) => {
     updateParticipantCount()
     showToast(`${remotePeerId} 已断开`)
+  })
+
+  // I10: 重连时重启信令轮询
+  webrtc.onReconnect((remotePeerId, attempt) => {
+    if (app.signalClient) {
+      app.signalClient.reset()
+    }
+    showToast(`正在重连 ${remotePeerId} (第${attempt}次)...`)
+  })
+
+  // I9: DataChannel 就绪通知
+  webrtc.onDataChannelOpen((remotePeerId) => {
+    showToast('数据通道已就绪')
   })
 
   // 信令消息路由到 WebRTC
@@ -133,8 +149,6 @@ function setupWebRTC(webrtc) {
         webrtc.handleIceCandidate(msg.from, msg.data)
         break
       case 'join':
-        // join 通知通过 DataChannel 无关路径处理
-        // 实际上 join 是通过 signal 通道发送的，需要在这里处理
         if (app.isHost) {
           webrtc.initiateConnection(msg.from)
         }
@@ -145,13 +159,17 @@ function setupWebRTC(webrtc) {
   app.signalClient.onTimeout(() => {
     showToast('信令超时，请重试')
   })
+
+  // I1: 信令发送错误通知
+  app.signalClient.onError((e) => {
+    console.error('Signal error:', e.message)
+  })
 }
 
 // 屏幕共享
 async function handleShareScreen() {
   try {
     const stream = await app.webrtcClient.startScreenShare()
-    // 房主自己也显示画面
     const video = $('screen-video')
     video.srcObject = stream
     $('screen-placeholder').style.display = 'none'
@@ -213,11 +231,16 @@ function handleSendChat() {
   input.value = ''
 }
 
+// C1: XSS 修复 — 使用 textContent 代替 innerHTML
 function appendChatMessage(from, text) {
   const messages = $('chat-messages')
   const div = document.createElement('div')
   div.className = 'chat-msg'
-  div.innerHTML = `<span class="from">${from}:</span> ${text}`
+  const span = document.createElement('span')
+  span.className = 'from'
+  span.textContent = `${from}:`
+  div.appendChild(span)
+  div.appendChild(document.createTextNode(` ${text}`))
   messages.appendChild(div)
   messages.scrollTop = messages.scrollHeight
 }
@@ -266,13 +289,18 @@ function init() {
     if (e.key === 'Enter') handleSendChat()
   })
 
-  // 页面关闭时清理
+  // I3: 使用 keepalive 确保页面卸载前请求发出
   window.addEventListener('beforeunload', () => {
     if (app.state === 'room') {
       if (app.webrtcClient) app.webrtcClient.close()
       if (app.signalClient) app.signalClient.stop()
       if (app.roomClient && app.roomCode) {
-        app.roomClient.leaveRoom(app.roomCode, app.peerId).catch(() => {})
+        fetch(`${API_BASE}/api/room/${app.roomCode}`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ peerId: app.peerId }),
+          keepalive: true
+        }).catch(() => {})
       }
     }
   })

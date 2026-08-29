@@ -52,6 +52,16 @@ describe('Worker API', () => {
       expect(data.roomCode).toHaveLength(6)
       expect(data.peerId).toBe('host-123')
     })
+
+    it('returns 400 for missing peerId', async () => {
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', {}), env)
+      expect(res.status).toBe(400)
+    })
+
+    it('returns 400 for empty peerId', async () => {
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: '' }), env)
+      expect(res.status).toBe(400)
+    })
   })
 
   describe('GET /api/room/:code', () => {
@@ -103,10 +113,27 @@ describe('Worker API', () => {
       expect(data.messages).toHaveLength(1)
       expect(data.messages[0].type).toBe('offer')
     })
+
+    it('caps signal messages at 100 entries', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      // 写入 110 条信令
+      for (let i = 0; i < 110; i++) {
+        await worker.fetch(jsonRequest('POST', `/api/signal/${roomCode}`, {
+          from: 'host-123', to: 'guest-456', type: 'ice', data: `ice-${i}`
+        }), env)
+      }
+      const res = await worker.fetch(new Request(`http://localhost/api/signal/${roomCode}?since=0`), env)
+      const data = await res.json()
+      expect(data.messages).toHaveLength(100)
+      // 验证保留了最后 100 条
+      expect(data.messages[0].data).toBe('ice-10')
+      expect(data.messages[99].data).toBe('ice-109')
+    })
   })
 
   describe('DELETE /api/room/:code', () => {
-    it('deletes the room', async () => {
+    it('deletes the room when host requests', async () => {
       const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
       const { roomCode } = await createRes.json()
       const res = await worker.fetch(jsonRequest('DELETE', `/api/room/${roomCode}`, { peerId: 'host-123' }), env)
@@ -115,6 +142,21 @@ describe('Worker API', () => {
       expect(data.ok).toBe(true)
       const getRes = await worker.fetch(new Request(`http://localhost/api/room/${roomCode}`), env)
       expect(getRes.status).toBe(404)
+    })
+
+    it('returns 403 when non-host tries to delete', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(jsonRequest('DELETE', `/api/room/${roomCode}`, { peerId: 'guest-456' }), env)
+      expect(res.status).toBe(403)
+      // 验证房间仍然存在
+      const getRes = await worker.fetch(new Request(`http://localhost/api/room/${roomCode}`), env)
+      expect(getRes.status).toBe(200)
+    })
+
+    it('returns 404 for non-existent room', async () => {
+      const res = await worker.fetch(jsonRequest('DELETE', '/api/room/INVALID', { peerId: 'host-123' }), env)
+      expect(res.status).toBe(404)
     })
   })
 })

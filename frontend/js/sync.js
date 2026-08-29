@@ -22,6 +22,7 @@ export class SyncController {
     this.isHost = isHost
     this.syncTimer = null
     this.chatCallbacks = []
+    this.loadUrlCallbacks = []
 
     this.webrtc.onDataMessage((data, remotePeerId) => {
       this.handleDataMessage(data)
@@ -52,6 +53,11 @@ export class SyncController {
     }
   }
 
+  // I5: 加入者收到 load 时通知 UI 隐藏 placeholder
+  onLoadUrl(callback) {
+    this.loadUrlCallbacks.push(callback)
+  }
+
   handleDataMessage(data) {
     if (data.type === 'chat') {
       this.chatCallbacks.forEach(cb => cb(data))
@@ -63,6 +69,7 @@ export class SyncController {
     switch (data.type) {
       case 'load':
         this.video.src = data.url
+        this.loadUrlCallbacks.forEach(cb => cb(data.url))
         break
       case 'play':
         this.video.currentTime = data.time
