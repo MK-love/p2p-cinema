@@ -179,6 +179,19 @@ function setupWebRTC(webrtc) {
     showToast(`${remotePeerId} 已断开`)
   })
 
+  // 重连用尽：对端确定离线，房主移除该成员并广播（防止幽灵成员残留）
+  webrtc.onPeerFailed((remotePeerId) => {
+    updateParticipantCount()
+    if (!app.isHost) return
+    const left = app.participants.find(p => p.peerId === remotePeerId)
+    app.participants = app.participants.filter(p => p.peerId !== remotePeerId)
+    if (app.syncController) {
+      app.syncController.broadcastParticipants(app.participants)
+    }
+    renderParticipants()
+    showToast(`${left?.nickname || remotePeerId} 已掉线`)
+  })
+
   webrtc.onReconnect((remotePeerId, attempt) => {
     if (app.signalClient) {
       app.signalClient.reset()

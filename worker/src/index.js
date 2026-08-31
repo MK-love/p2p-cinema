@@ -38,12 +38,16 @@ async function handleRoom(request, env, method, pathParts) {
     if (!validatePeerId(body.peerId)) {
       return jsonResponse({ error: 'Invalid peerId' }, 400)
     }
-    // C2: 检查房间码碰撞，最多重试 5 次
+    // C2: 检查房间码碰撞，最多重试 5 次；全部碰撞则失败，绝不覆盖已有房间
     let roomCode
+    let collision = true
     for (let i = 0; i < 5; i++) {
       roomCode = generateRoomCode()
       const existing = await env.ROOMS.get(roomCode)
-      if (!existing) break
+      if (!existing) { collision = false; break }
+    }
+    if (collision) {
+      return jsonResponse({ error: 'Room code collision, please retry' }, 503)
     }
     const room = {
       hostId: body.peerId,
@@ -70,7 +74,12 @@ async function handleRoom(request, env, method, pathParts) {
     const data = await env.ROOMS.get(code)
     if (!data) return jsonResponse({ error: 'Room not found or expired' }, 404)
     const room = JSON.parse(data)
-    const body = await request.json()
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return jsonResponse({ error: 'Invalid JSON body' }, 400)
+    }
     if (!validatePeerId(body.peerId)) {
       return jsonResponse({ error: 'Invalid peerId' }, 400)
     }
@@ -92,7 +101,17 @@ async function handleSignal(request, env, method, code) {
 
   // POST /api/signal/:code — 发送信令消息
   if (method === 'POST') {
-    const body = await request.json()
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return jsonResponse({ error: 'Invalid JSON body' }, 400)
+    }
+    // 输入校验：拒绝垃圾消息入库，避免污染轮询端
+    if (!validatePeerId(body.from) || !validatePeerId(body.to) ||
+        typeof body.type !== 'string' || body.type.length === 0) {
+      return jsonResponse({ error: 'Invalid signal payload' }, 400)
+    }
     const signalsRaw = await env.SIGNALS.get(code)
     const signals = signalsRaw ? JSON.parse(signalsRaw) : []
     signals.push({

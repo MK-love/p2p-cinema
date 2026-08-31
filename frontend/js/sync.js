@@ -35,15 +35,21 @@ export class SyncController {
 
   init() {
     if (this.isHost) {
-      this.video.addEventListener('play', () => {
-        this.webrtc.sendData(formatSyncMessage('play', { time: this.video.currentTime }))
-      })
-      this.video.addEventListener('pause', () => {
-        this.webrtc.sendData(formatSyncMessage('pause', { time: this.video.currentTime }))
-      })
-      this.video.addEventListener('seeked', () => {
-        this.webrtc.sendData(formatSyncMessage('seek', { time: this.video.currentTime }))
-      })
+      // 保存 handler 引用，destroy 时按需移除（防止反复进出房间叠加监听器）
+      this._handlers = {
+        play: () => {
+          this.webrtc.sendData(formatSyncMessage('play', { time: this.video.currentTime }))
+        },
+        pause: () => {
+          this.webrtc.sendData(formatSyncMessage('pause', { time: this.video.currentTime }))
+        },
+        seeked: () => {
+          this.webrtc.sendData(formatSyncMessage('seek', { time: this.video.currentTime }))
+        }
+      }
+      for (const [event, handler] of Object.entries(this._handlers)) {
+        this.video.addEventListener(event, handler)
+      }
       this.syncTimer = setInterval(() => {
         this.webrtc.sendData(formatSyncMessage('sync', { time: this.video.currentTime }))
       }, SYNC_INTERVAL)
@@ -157,5 +163,11 @@ export class SyncController {
 
   destroy() {
     if (this.syncTimer) clearInterval(this.syncTimer)
+    if (this._handlers) {
+      for (const [event, handler] of Object.entries(this._handlers)) {
+        this.video.removeEventListener(event, handler)
+      }
+      this._handlers = null
+    }
   }
 }

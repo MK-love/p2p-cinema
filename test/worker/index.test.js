@@ -62,6 +62,17 @@ describe('Worker API', () => {
       const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: '' }), env)
       expect(res.status).toBe(400)
     })
+
+    it('fails with 503 when all room code collision retries are exhausted, without overwriting existing rooms', async () => {
+      // 模拟房间码恒碰撞：ROOMS.get 永远返回已存在的房间
+      let putCount = 0
+      env.ROOMS.get = async () => JSON.stringify({ hostId: 'someone-else', participants: ['someone-else'] })
+      env.ROOMS.put = async () => { putCount++ }
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      expect(res.status).toBe(503)
+      // 关键断言：绝不覆盖他人房间
+      expect(putCount).toBe(0)
+    })
   })
 
   describe('GET /api/room/:code', () => {
@@ -97,6 +108,43 @@ describe('Worker API', () => {
         from: 'a', to: 'b', type: 'offer', data: 'x'
       }), env)
       expect(res.status).toBe(404)
+    })
+
+    it('returns 400 for invalid JSON body instead of crashing with 500', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const req = new Request(`http://localhost/api/signal/${roomCode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: 'not-json{{{'
+      })
+      const res = await worker.fetch(req, env)
+      expect(res.status).toBe(400)
+    })
+
+    it('returns 400 for empty body', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const req = new Request(`http://localhost/api/signal/${roomCode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+      const res = await worker.fetch(req, env)
+      expect(res.status).toBe(400)
+    })
+
+    it('returns 400 when required fields are missing and stores nothing', async () => {
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      // 缺 to / type
+      const res = await worker.fetch(jsonRequest('POST', `/api/signal/${roomCode}`, {
+        from: 'host-123', data: 'x'
+      }), env)
+      expect(res.status).toBe(400)
+      // 垃圾消息不应入库
+      const pollRes = await worker.fetch(new Request(`http://localhost/api/signal/${roomCode}?since=0`), env)
+      const { messages } = await pollRes.json()
+      expect(messages).toHaveLength(0)
     })
   })
 

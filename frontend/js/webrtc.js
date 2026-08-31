@@ -30,6 +30,7 @@ export class WebRTCClient {
     this.connectedCallbacks = []
     this.disconnectedCallbacks = []
     this.reconnectCallbacks = []
+    this.peerFailedCallbacks = []
   }
 
   onRemoteStream(callback) {
@@ -62,9 +63,16 @@ export class WebRTCClient {
     this.reconnectCallbacks.push(callback)
   }
 
+  // 重连次数用尽通知：上层应移除该对端（防止幽灵成员残留）
+  onPeerFailed(callback) {
+    this.peerFailedCallbacks.push(callback)
+  }
+
   createConnection(remotePeerId) {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
     pc._reconnectAttempts = 0
+    // 候选缓冲：setRemoteDescription 完成前到达的 ICE 候选先入队，避免被浏览器丢弃
+    pc._pendingCandidates = []
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -83,6 +91,9 @@ export class WebRTCClient {
           pc._reconnectAttempts++
           const delay = pc._reconnectAttempts * 2000
           setTimeout(() => this.tryReconnect(remotePeerId), delay)
+        } else {
+          // 重试用尽：对端确定离线，通知上层移除（幽灵成员治理）
+          this.peerFailedCallbacks.forEach(cb => cb(remotePeerId))
         }
       }
     }
@@ -120,7 +131,12 @@ export class WebRTCClient {
       this.dataChannelCloseCallbacks.forEach(cb => cb(remotePeerId))
     }
     dc.onmessage = (event) => {
-      const data = JSON.parse(event.data)
+      let data
+      try {
+        data = JSON.parse(event.data)
+      } catch {
+        return // 忽略无法解析的消息，避免中断后续消息分发
+      }
       this.dataMessageCallbacks.forEach(cb => cb(data, remotePeerId))
     }
   }
@@ -165,19 +181,43 @@ export class WebRTCClient {
     const answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     await this.signalClient.send(remotePeerId, 'answer', JSON.stringify(answer))
+    await this._flushCandidates(pc)
   }
 
   async handleAnswer(remotePeerId, sdp) {
     const pc = this.connections.get(remotePeerId)
     if (pc) {
       await pc.setRemoteDescription(JSON.parse(sdp))
+      await this._flushCandidates(pc)
+    }
+  }
+
+  // 候选就绪后按序应用缓冲队列
+  async _flushCandidates(pc) {
+    const pending = pc._pendingCandidates
+    pc._pendingCandidates = []
+    for (const candidate of pending) {
+      try {
+        await pc.addIceCandidate(candidate)
+      } catch (e) {
+        console.warn('ICE candidate apply failed:', e)
+      }
     }
   }
 
   async handleIceCandidate(remotePeerId, candidate) {
     const pc = this.connections.get(remotePeerId)
-    if (pc) {
-      await pc.addIceCandidate(JSON.parse(candidate))
+    if (!pc) return
+    const parsed = JSON.parse(candidate)
+    // remoteDescription 未就绪时（offer/answer 仍在处理中）缓冲，否则浏览器会抛 InvalidStateError 丢弃候选
+    if (!pc.remoteDescription) {
+      pc._pendingCandidates.push(parsed)
+      return
+    }
+    try {
+      await pc.addIceCandidate(parsed)
+    } catch (e) {
+      console.warn('ICE candidate apply failed:', e)
     }
   }
 
