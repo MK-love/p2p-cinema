@@ -30,15 +30,9 @@ jobs:
           fi
           echo "Cloudflare secrets are configured."
 
-      - name: Deploy Worker
+      - name: Deploy Worker (API + frontend assets)
         run: npx wrangler deploy
         working-directory: worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      - name: Deploy Pages
-        run: npx wrangler pages deploy frontend --project-name=p2p-cinema
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

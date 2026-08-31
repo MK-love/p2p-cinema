@@ -5,10 +5,10 @@ import { SignalClient } from './signal.js'
 import { WebRTCClient } from './webrtc.js'
 import { SyncController } from './sync.js'
 
-// 根据环境配置 API 地址
+// 根据环境配置 API 地址（生产环境前端与 API 同域，自动适配部署域名）
 const API_BASE = window.location.hostname === 'localhost'
   ? 'http://localhost:8787'
-  : 'https://p2p-cinema.maxk666666.workers.dev'
+  : window.location.origin
 
 const app = {
   state: 'home',

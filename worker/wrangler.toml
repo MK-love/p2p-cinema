@@ -2,6 +2,11 @@ name = "p2p-cinema-api"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# 前端静态资产与 API 同域部署：/api/* 进 Worker，其余由静态资产服务
+[assets]
+directory = "../frontend"
+run_worker_first = ["/api/*"]
+
 # 部署前替换为真实 KV Namespace ID
 # 创建方式: Cloudflare Dashboard → Workers & Pages → KV → Create Namespace
 # 创建两个 namespace: p2p-cinema-rooms 和 p2p-cinema-signals
