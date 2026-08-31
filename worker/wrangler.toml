@@ -8,8 +8,8 @@ compatibility_date = "2024-01-01"
 # 然后将下方 id 替换为各自的 namespace ID
 [[kv_namespaces]]
 binding = "ROOMS"
-id = "your-kv-namespace-id"
+id = "5f67fff67d864b61997c720a62090080"
 
 [[kv_namespaces]]
 binding = "SIGNALS"
-id = "your-kv-namespace-id"
+id = "fc595fcbbf594992befee61cd7ae5039"
