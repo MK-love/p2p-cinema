@@ -87,19 +87,39 @@ export class WebRTCClient {
     }
 
     // I10: 断连自动重连（ICE restart）
+    // 修复：真正失败(failed)才消耗重连机会并重启（瞬时 disconnected 仅通知，避免
+    // 「时不时重连」）；计时器去重+绑定当前 pc，防止多次状态回调堆积多个计时器，
+    // 或被替换后的旧 pc 干扰新连接
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
+      const state = pc.connectionState
+      if (state === 'connected') {
         pc._reconnectAttempts = 0
+        if (pc._reconnectTimer) {
+          clearTimeout(pc._reconnectTimer)
+          pc._reconnectTimer = null
+        }
         this.connectedCallbacks.forEach(cb => cb(remotePeerId))
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+      } else if (state === 'disconnected') {
         this.disconnectedCallbacks.forEach(cb => cb(remotePeerId))
-        if (pc._reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          pc._reconnectAttempts++
-          const delay = pc._reconnectAttempts * 2000
-          setTimeout(() => this.tryReconnect(remotePeerId), delay)
+      } else if (state === 'failed') {
+        this.disconnectedCallbacks.forEach(cb => cb(remotePeerId))
+        pc._reconnectAttempts++
+        if (pc._reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+          if (!pc._reconnectTimer) {
+            const attempt = pc._reconnectAttempts
+            pc._reconnectTimer = setTimeout(() => {
+              pc._reconnectTimer = null
+              this.tryReconnect(remotePeerId, pc, attempt)
+            }, attempt * 2000)
+          }
         } else {
           // 重试用尽：对端确定离线，通知上层移除（幽灵成员治理）
           this.peerFailedCallbacks.forEach(cb => cb(remotePeerId))
+        }
+      } else if (state === 'closed') {
+        if (pc._reconnectTimer) {
+          clearTimeout(pc._reconnectTimer)
+          pc._reconnectTimer = null
         }
       }
     }
@@ -167,10 +187,14 @@ export class WebRTCClient {
 
   // I1: await send
   async initiateConnection(remotePeerId) {
-    // 对端断线重连时服务端会再次广播 join：先关闭旧连接重建，
-    // 避免连接泄漏 / 残留半开 pc（DataChannel 残留会导致消息发往死通道）
     const existing = this.connections.get(remotePeerId)
+    // WS 闪断会导致服务端重复广播 join：若 WebRTC 连接仍健康（connected/connecting）
+    // 则跳过，避免反复拆旧建新打断画面与屏幕流；仅当连接缺失或确证失效才重建
+    if (existing && (existing.connectionState === 'connected' || existing.connectionState === 'connecting')) {
+      return
+    }
     if (existing) {
+      // 已失效/半开：先关闭回收，避免连接泄漏 / 残留半开 pc
       this.connections.delete(remotePeerId)
       existing.close()
     }
@@ -265,11 +289,12 @@ export class WebRTCClient {
     await this.signalClient.send(remotePeerId, 'offer', JSON.stringify(offer))
   }
 
-  // I10: ICE restart 重连
-  async tryReconnect(remotePeerId) {
-    const pc = this.connections.get(remotePeerId)
-    if (!pc || pc.connectionState === 'connected') return
-    this.reconnectCallbacks.forEach(cb => cb(remotePeerId, pc._reconnectAttempts))
+  // I10: ICE restart 重连（绑定特定 pc：若该连接已被重建/替换或已连接，则跳过，
+  // 避免旧计时器作用到新连接上造成反复无谓 ICE-restart）
+  async tryReconnect(remotePeerId, pc, attempt) {
+    if (this.connections.get(remotePeerId) !== pc) return // pc 已被替换
+    if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return
+    this.reconnectCallbacks.forEach(cb => cb(remotePeerId, attempt))
     try {
       const offer = await pc.createOffer({ iceRestart: true })
       await pc.setLocalDescription(offer)

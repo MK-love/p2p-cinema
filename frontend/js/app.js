@@ -159,16 +159,23 @@ function handleRoomDissolved() {
   showToast('房主已解散房间')
 }
 
-// 对端离开：房主移除成员并广播成员列表（WS peer-left 与 DataChannel peer-left 共用）
+// 对端离开：WS peer-left 与 DataChannel peer-left 共用。
+// 但 WS 闪断立即广播 peer-left 时，WebRTC 链路往往仍健在——只有连接确证失效
+// 才真正移除成员，否则视为瞬时抖动（等 WS 重连后服务端自动补发 join 接回）
 function handleRemotePeerLeft(peerId) {
   if (!app.isHost) return
-  const left = app.participants.find(p => p.peerId === peerId)
+  const name = app.participants.find(p => p.peerId === peerId)?.nickname || peerId
+  const pc = app.webrtcClient?.connections?.get(peerId)
+  if (pc && (pc.connectionState === 'connected' || pc.connectionState === 'connecting')) {
+    showToast(`${name} 网络瞬断，正在重连…`)
+    return
+  }
   app.participants = app.participants.filter(p => p.peerId !== peerId)
   if (app.syncController) {
     app.syncController.broadcastParticipants(app.participants)
   }
   renderParticipants()
-  showToast(`${left?.nickname || peerId} 已退出房间`)
+  showToast(`${name} 已退出房间`)
 }
 
 // WebRTC 设置
