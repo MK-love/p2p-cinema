@@ -215,7 +215,7 @@ function setupWebRTC(webrtc) {
   })
 
   app.signalClient.onTimeout(() => {
-    showToast('信令超时，请重试')
+    showToast('房间不存在或已过期')
   })
 
   app.signalClient.onError((e) => {

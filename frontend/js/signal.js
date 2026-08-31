@@ -1,7 +1,6 @@
 // frontend/js/signal.js — 信令客户端（HTTP 轮询）
 
 const POLL_INTERVAL = 500
-const POLL_TIMEOUT = 30000
 
 export class SignalClient {
   constructor(apiBase, roomCode, peerId) {
@@ -11,7 +10,6 @@ export class SignalClient {
     this.lastTs = 0
     this.running = false
     this.timerId = null
-    this.startTime = 0
     this.messageCallbacks = []
     this.timeoutCallbacks = []
     this.errorCallbacks = []
@@ -47,13 +45,11 @@ export class SignalClient {
 
   start() {
     this.running = true
-    this.startTime = Date.now()
     this.poll()
   }
 
-  // I10: 重连时重置超时计时器，恢复轮询
+  // I10: 重连时恢复轮询
   reset() {
-    this.startTime = Date.now()
     this.running = true
     if (!this.timerId) {
       this.poll()
@@ -75,14 +71,14 @@ export class SignalClient {
   async poll() {
     if (!this.running) return
 
-    if (Date.now() - this.startTime > POLL_TIMEOUT) {
-      this.timeoutCallbacks.forEach(cb => cb())
-      this.stop()
-      return
-    }
-
     try {
       const res = await fetch(`${this.apiBase}/api/signal/${this.roomCode}?since=${this.lastTs}`)
+      if (res.status === 404) {
+        // 房间不存在或已过期 — 信令通道随房间生命周期结束
+        this.timeoutCallbacks.forEach(cb => cb())
+        this.stop()
+        return
+      }
       if (res.ok) {
         const { messages } = await res.json()
         for (const msg of messages) {
