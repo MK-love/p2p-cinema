@@ -1,6 +1,9 @@
 // frontend/js/webrtc.js — WebRTC 封装（P2P mesh + DataChannel）
 
-const ICE_SERVERS = [
+// ICE 服务器：Google STUN 在中国大陆不可达，补充 Cloudflare 与国内公共 STUN 保证跨网打洞
+export const ICE_SERVERS = [
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:stun.miwifi.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' }
 ]

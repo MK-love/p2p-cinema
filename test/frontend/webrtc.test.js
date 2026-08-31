@@ -1,7 +1,30 @@
-// test/frontend/webrtc.test.js — 屏幕共享能力检测测试
+// test/frontend/webrtc.test.js — WebRTC 配置与屏幕共享能力测试
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { WebRTCClient, isScreenShareSupported } from '../../frontend/js/webrtc.js'
+import { WebRTCClient, isScreenShareSupported, ICE_SERVERS } from '../../frontend/js/webrtc.js'
+
+function allStunUrls() {
+  return ICE_SERVERS.flatMap(s => Array.isArray(s.urls) ? s.urls : [s.urls])
+}
+
+describe('ICE 服务器配置', () => {
+  it('包含国内可达的备用 STUN（不能只有 Google STUN）', () => {
+    const urls = allStunUrls()
+    const hasCloudflareStun = urls.some(u => u.includes('stun.cloudflare.com'))
+    const hasChinaStun = urls.some(u => /miwifi|hitv|cssdns|qq\.com/.test(u))
+    expect(hasCloudflareStun || hasChinaStun).toBe(true)
+  })
+
+  it('所有 STUN 地址均为合法格式', () => {
+    for (const url of allStunUrls()) {
+      expect(url).toMatch(/^stun:[a-z0-9.\-]+:\d+$/)
+    }
+  })
+
+  it('至少保留 2 台 STUN 服务器做冗余', () => {
+    expect(allStunUrls().length).toBeGreaterThanOrEqual(2)
+  })
+})
 
 describe('屏幕共享能力检测', () => {
   afterEach(() => {

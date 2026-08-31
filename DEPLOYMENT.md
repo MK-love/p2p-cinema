@@ -293,12 +293,16 @@ GET /api/signal/K4JJYH?since=1695000000000
 
 ### STUN 服务器
 
-使用 Google 免费 STUN 服务器：
+采用多 STUN 冗余（ICE 并行收集候选，谁可达用谁）：
 
-- `stun:stun.l.google.com:19302`
-- `stun:stun1.l.google.com:19302`
+- `stun:stun.cloudflare.com:3478`（Cloudflare 官方，国内可达）
+- `stun:stun.miwifi.com:3478`（小米公共 STUN，国内可达）
+- `stun:stun.l.google.com:19302`（Google，境外可达）
+- `stun:stun1.l.google.com:19302`（Google，境外可达）
 
-修改位置：[frontend/js/webrtc.js](frontend/js/webrtc.js) 第 3-6 行
+修改位置：[frontend/js/webrtc.js](frontend/js/webrtc.js) 第 3-9 行
+
+> 注意：Google STUN 在中国大陆被墙，若只配置 Google STUN，国内直连设备将无法建立 P2P 连接（表现为进入房间但看不到共享画面）。
 
 ## 成本估算
 
