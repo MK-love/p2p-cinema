@@ -171,6 +171,21 @@ describe('Worker REST API', () => {
       expect(res.status).toBe(404)
     })
   })
+
+  describe('GET /api/turn — 动态 TURN 凭据', () => {
+    it('未配置 TURN 密钥时返回 enabled:false（前端回退静态 ICE）', async () => {
+      const res = await worker.fetch(new Request('http://localhost/api/turn'), env)
+      expect(res.status).toBe(200)
+      const data = await res.json()
+      expect(data.enabled).toBe(false)
+    })
+
+    it('未配置时无需访问外部 API 即可快速响应', async () => {
+      // env 中无任何 TURN 密钥 —— 不应抛错
+      const res = await worker.fetch(new Request('http://localhost/api/turn'), env)
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*')
+    })
+  })
 })
 
 describe('RoomSignalDO（单房间状态机）', () => {

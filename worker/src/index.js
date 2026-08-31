@@ -292,6 +292,36 @@ export default {
       return stub.fetch(request)
     }
 
+    // GET /api/turn — 动态 TURN 凭据（Cloudflare Calls TURN）
+    // 未配置三个密钥时返回 { enabled:false }，前端回退到内置静态 STUN/TURN；
+    // 配置方式见 DEPLOYMENT.md「TURN 中继」一节
+    if (parts[1] === 'turn' && request.method === 'GET') {
+      const accountId = env.CF_ACCOUNT_ID
+      const keyId = env.CALLS_TURN_KEY_ID
+      const apiToken = env.CALLS_TURN_API_TOKEN
+      if (!accountId || !keyId || !apiToken) {
+        return jsonResponse({ enabled: false, reason: 'TURN not configured' })
+      }
+      try {
+        const res = await fetch(
+          `https://api.cloudflare.com/client/v4/accounts/${accountId}/calls/turn_keys/${keyId}/credentials`,
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ttl: 3600 })
+          }
+        )
+        const data = await res.json()
+        const iceServers = data?.result?.iceServers
+        if (!res.ok || !iceServers?.urls?.length) {
+          return jsonResponse({ enabled: false, reason: 'credential request failed' }, 502)
+        }
+        return jsonResponse({ enabled: true, iceServers })
+      } catch {
+        return jsonResponse({ enabled: false, reason: 'credential request error' }, 502)
+      }
+    }
+
     return jsonResponse({ error: 'Not found' }, 404)
   }
 }

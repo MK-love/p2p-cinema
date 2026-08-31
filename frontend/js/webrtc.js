@@ -23,10 +23,12 @@ export function isScreenShareSupported() {
 }
 
 export class WebRTCClient {
-  constructor(peerId, signalClient, isHost = false) {
+  constructor(peerId, signalClient, isHost = false, iceServers = ICE_SERVERS) {
     this.peerId = peerId
     this.signalClient = signalClient
     this.isHost = isHost
+    // iceServers 可由 /api/turn 动态注入（Cloudflare Calls TURN）；缺省用内置静态配置
+    this.iceServers = iceServers
     this.connections = new Map()
     this.dataChannels = new Map()
     this.localStream = null
@@ -76,7 +78,7 @@ export class WebRTCClient {
   }
 
   createConnection(remotePeerId) {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers })
     pc._reconnectAttempts = 0
     // 候选缓冲：setRemoteDescription 完成前到达的 ICE 候选先入队，避免被浏览器丢弃
     pc._pendingCandidates = []

@@ -47,6 +47,20 @@ function generateNickname() {
   return '用户-' + suffix
 }
 
+// 动态获取 ICE 配置：服务端配置了 Cloudflare Calls TURN 时返回带中继的 iceServers，
+// 未配置/失败时返回 undefined，WebRTCClient 回退到内置静态 STUN/TURN
+async function fetchIceServers() {
+  try {
+    const res = await fetch(API_BASE + '/api/turn')
+    const data = await res.json()
+    if (data?.enabled && Array.isArray(data.iceServers?.urls) && data.iceServers.urls.length > 0) {
+      console.info('[ICE] 使用动态 TURN 凭据:', data.iceServers.urls)
+      return [data.iceServers]
+    }
+  } catch {}
+  return undefined
+}
+
 function showPage(page) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'))
   $(`${page}-page`).classList.add('active')
@@ -70,10 +84,11 @@ async function handleCreateRoom() {
   app.isHost = true
   app.roomClient = new RoomClient(API_BASE)
   try {
+    const iceServers = await fetchIceServers()
     const result = await app.roomClient.createRoom(app.peerId)
     app.roomCode = result.roomCode
     app.signalClient = new SignalClient(API_BASE, app.roomCode, app.peerId)
-    app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, true)
+    app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, true, iceServers)
     setupWebRTC(app.webrtcClient)
     app.signalClient.start()
     enterRoom()
@@ -100,9 +115,10 @@ async function handleJoinRoom() {
   try {
     // 校验房间存在（404 会抛错并提示）
     await app.roomClient.joinRoom(code)
+    const iceServers = await fetchIceServers()
     app.roomCode = code
     app.signalClient = new SignalClient(API_BASE, app.roomCode, app.peerId)
-    app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, false)
+    app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, false, iceServers)
     setupWebRTC(app.webrtcClient)
     // v2：WS 连接建立后由服务端自动向房主广播 join，无需客户端手动发送
     app.signalClient.start()
