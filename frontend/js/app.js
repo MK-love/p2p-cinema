@@ -2,7 +2,7 @@
 
 import { RoomClient } from './room.js'
 import { SignalClient } from './signal.js'
-import { WebRTCClient } from './webrtc.js'
+import { WebRTCClient, isScreenShareSupported } from './webrtc.js'
 import { SyncController } from './sync.js'
 
 // 根据环境配置 API 地址（生产环境前端与 API 同域，自动适配部署域名）
@@ -251,7 +251,7 @@ function handleStopScreen() {
   const video = $('screen-video')
   video.srcObject = null
   $('screen-placeholder').style.display = 'block'
-  $('btn-share-screen').style.display = 'inline-block'
+  $('btn-share-screen').style.display = isScreenShareSupported() ? 'inline-block' : 'none'
   $('btn-stop-screen').style.display = 'none'
 }
 
@@ -363,7 +363,7 @@ function resetAppState() {
   $('url-video').src = ''
   $('screen-placeholder').style.display = 'block'
   $('url-placeholder').style.display = 'block'
-  $('btn-share-screen').style.display = 'inline-block'
+  $('btn-share-screen').style.display = isScreenShareSupported() ? 'inline-block' : 'none'
   $('btn-stop-screen').style.display = 'none'
   // 重置音量
   $('screen-volume').value = '1'
@@ -398,6 +398,10 @@ function init() {
   })
   $('btn-leave').addEventListener('click', handleLeaveRoom)
   $('btn-share-screen').addEventListener('click', handleShareScreen)
+  // 不支持屏幕共享的设备（手机端）直接隐藏按钮，避免误点报错
+  if (!isScreenShareSupported()) {
+    $('btn-share-screen').style.display = 'none'
+  }
   $('btn-stop-screen').addEventListener('click', handleStopScreen)
   $('btn-load-url').addEventListener('click', handleLoadUrl)
   $('btn-mode-screen').addEventListener('click', () => switchMode('screen'))

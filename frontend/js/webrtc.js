@@ -7,6 +7,11 @@ const ICE_SERVERS = [
 
 const MAX_RECONNECT_ATTEMPTS = 3
 
+// 屏幕共享能力检测：iOS/iPadOS 全系浏览器及新版 Android Chrome 均不支持 getDisplayMedia
+export function isScreenShareSupported() {
+  return typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia
+}
+
 export class WebRTCClient {
   constructor(peerId, signalClient, isHost = false) {
     this.peerId = peerId
@@ -118,6 +123,9 @@ export class WebRTCClient {
   }
 
   async startScreenShare() {
+    if (!isScreenShareSupported()) {
+      throw new Error('当前浏览器不支持屏幕共享（手机端浏览器均不支持），请在电脑端使用 Chrome/Edge/Firefox 观看和发起共享')
+    }
     this.localStream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: 30 },
       audio: true
