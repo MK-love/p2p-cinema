@@ -4,6 +4,7 @@
 export const ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.miwifi.com:3478' },
+  { urls: 'stun:stun.qq.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   // 免费 TURN（Open Relay 公共服务）：对称 NAT / 企业网 / 蜂窝网络下 STUN
@@ -79,10 +80,18 @@ export class WebRTCClient {
     pc._reconnectAttempts = 0
     // 候选缓冲：setRemoteDescription 完成前到达的 ICE 候选先入队，避免被浏览器丢弃
     pc._pendingCandidates = []
+    // ICE 诊断：记录本端候选类型（host/srflx/relay），失败时输出定位网络层问题
+    pc._candidateTypes = new Set()
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        // 诊断：记录候选类型（host=局域网 / srflx=STUN 打洞 / relay=TURN 中转）
+        pc._candidateTypes.add(event.candidate.type || 'unknown')
         this.signalClient.send(remotePeerId, 'ice', JSON.stringify(event.candidate))
+      } else if (pc._candidateTypes.size === 0) {
+        console.warn(`[ICE] ${remotePeerId}: 本端未收集到任何候选（STUN 全部不可达？）`)
+      } else {
+        console.info(`[ICE] ${remotePeerId}: 本端候选类型 = [${[...pc._candidateTypes].join(', ')}]`)
       }
     }
 
