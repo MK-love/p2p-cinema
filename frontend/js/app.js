@@ -8,7 +8,7 @@ import { SyncController } from './sync.js'
 // 根据环境配置 API 地址
 const API_BASE = window.location.hostname === 'localhost'
   ? 'http://localhost:8787'
-  : 'https://p2p-cinema-api.your-account.workers.dev'
+  : 'https://p2p-cinema.maxk666666.workers.dev'
 
 const app = {
   state: 'home',
