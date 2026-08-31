@@ -61,6 +61,8 @@ function switchSidebarTab(tab) {
 
 // 创建房间
 async function handleCreateRoom() {
+  // 防重复触发（双击/回车+点击会建立双 WS，导致重复 join 广播与信令竞态）
+  if (app.state !== 'home') return
   app.peerId = generatePeerId()
   app.nickname = $('input-nickname').value.trim() || generateNickname()
   app.isHost = true
@@ -80,6 +82,8 @@ async function handleCreateRoom() {
 
 // 加入房间
 async function handleJoinRoom() {
+  // 防重复触发（双击/回车+点击会建立双 WS，导致重复 join 广播与信令竞态）
+  if (app.state !== 'home') return
   const code = $('input-room-code').value.trim().toUpperCase()
   if (code.length !== 6) {
     showToast('请输入 6 位邀请码')

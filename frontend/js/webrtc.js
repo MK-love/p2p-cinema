@@ -188,13 +188,15 @@ export class WebRTCClient {
   // I1: await send
   async initiateConnection(remotePeerId) {
     const existing = this.connections.get(remotePeerId)
-    // WS 闪断会导致服务端重复广播 join：若 WebRTC 连接仍健康（connected/connecting）
-    // 则跳过，避免反复拆旧建新打断画面与屏幕流；仅当连接缺失或确证失效才重建
-    if (existing && (existing.connectionState === 'connected' || existing.connectionState === 'connecting')) {
-      return
-    }
+    // WS 闪断会触发服务端重复广播 join：
+    //  - 连接健康（connected/connecting）：跳过，绝不打断画面与屏幕流
+    //  - 本端 offer 已发出待应答（have-local-offer）：跳过，等 answer 回来，
+    //    否则拆连接会把迟到 answer 变成 wrong-state 异常，握手死亡
+    //  仅当连接缺失或确证失效（failed 等）才回收重建
+    const healthy = existing && (existing.connectionState === 'connected' || existing.connectionState === 'connecting')
+    const offerPending = existing && existing.signalingState === 'have-local-offer'
+    if (healthy || offerPending) return
     if (existing) {
-      // 已失效/半开：先关闭回收，避免连接泄漏 / 残留半开 pc
       this.connections.delete(remotePeerId)
       existing.close()
     }
@@ -223,10 +225,16 @@ export class WebRTCClient {
 
   async handleAnswer(remotePeerId, sdp) {
     const pc = this.connections.get(remotePeerId)
-    if (pc) {
-      await pc.setRemoteDescription(JSON.parse(sdp))
-      await this._flushCandidates(pc)
+    if (!pc) return
+    // answer 只在 have-local-offer 状态合法。迟到/过期的 answer（连接已被重复
+    // join 重建、或对端应答了已被替换的旧 offer）在这里优雅忽略——否则
+    // InvalidStateError 未捕获会打断整个信令处理，握手彻底死亡
+    if (pc.signalingState !== 'have-local-offer') {
+      console.warn(`忽略迟到的 answer（${remotePeerId} 当前信令状态 ${pc.signalingState}）`)
+      return
     }
+    await pc.setRemoteDescription(JSON.parse(sdp))
+    await this._flushCandidates(pc)
   }
 
   // 候选就绪后按序应用缓冲队列
