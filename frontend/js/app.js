@@ -90,13 +90,14 @@ async function handleJoinRoom() {
   app.isHost = false
   app.roomClient = new RoomClient(API_BASE)
   try {
-    const room = await app.roomClient.joinRoom(code)
+    // 校验房间存在（404 会抛错并提示）
+    await app.roomClient.joinRoom(code)
     app.roomCode = code
     app.signalClient = new SignalClient(API_BASE, app.roomCode, app.peerId)
     app.webrtcClient = new WebRTCClient(app.peerId, app.signalClient, false)
     setupWebRTC(app.webrtcClient)
+    // v2：WS 连接建立后由服务端自动向房主广播 join，无需客户端手动发送
     app.signalClient.start()
-    await app.signalClient.send(room.hostId, 'join', app.peerId)
     enterRoom()
   } catch (e) {
     showToast(e.message)
@@ -143,22 +144,31 @@ function enterRoom() {
     renderParticipants()
   })
 
-  app.syncController.onPeerLeft((peerId) => {
-    if (!app.isHost) return
-    const left = app.participants.find(p => p.peerId === peerId)
-    app.participants = app.participants.filter(p => p.peerId !== peerId)
-    app.syncController.broadcastParticipants(app.participants)
-    renderParticipants()
-    showToast(`${left?.nickname || peerId} 已退出房间`)
-  })
+  app.syncController.onPeerLeft((peerId) => handleRemotePeerLeft(peerId))
 
-  app.syncController.onRoomDissolved(() => {
-    if (app.webrtcClient) app.webrtcClient.close()
-    if (app.signalClient) app.signalClient.stop()
-    if (app.syncController) app.syncController.destroy()
-    resetAppState()
-    showToast('房主已解散房间')
-  })
+  app.syncController.onRoomDissolved(() => handleRoomDissolved())
+}
+
+// 房间解散统一清理（DataChannel 广播与 WS 信令两个入口共用；幂等）
+function handleRoomDissolved() {
+  if (app.state !== 'room') return
+  if (app.webrtcClient) app.webrtcClient.close()
+  if (app.signalClient) app.signalClient.stop()
+  if (app.syncController) app.syncController.destroy()
+  resetAppState()
+  showToast('房主已解散房间')
+}
+
+// 对端离开：房主移除成员并广播成员列表（WS peer-left 与 DataChannel peer-left 共用）
+function handleRemotePeerLeft(peerId) {
+  if (!app.isHost) return
+  const left = app.participants.find(p => p.peerId === peerId)
+  app.participants = app.participants.filter(p => p.peerId !== peerId)
+  if (app.syncController) {
+    app.syncController.broadcastParticipants(app.participants)
+  }
+  renderParticipants()
+  showToast(`${left?.nickname || peerId} 已退出房间`)
 }
 
 // WebRTC 设置
@@ -223,6 +233,13 @@ function setupWebRTC(webrtc) {
         if (app.isHost) {
           webrtc.initiateConnection(msg.from)
         }
+        break
+      case 'peer-left':
+        // WS 断连即时通知（比 DataChannel 通知与重连超时更快）
+        handleRemotePeerLeft(msg.from)
+        break
+      case 'room-dissolved':
+        handleRoomDissolved()
         break
     }
   })

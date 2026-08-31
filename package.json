@@ -1,11 +1,14 @@
 {
   "name": "p2p-cinema",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
+  "description": "P2P 在线观影平台 — Cloudflare Workers + Durable Object + WebRTC，全免费套餐可部署",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "dev:worker": "wrangler dev --config worker/wrangler.toml"
+    "dev": "wrangler dev --config worker/wrangler.toml",
+    "dev:worker": "wrangler dev --config worker/wrangler.toml",
+    "deploy": "wrangler deploy --config worker/wrangler.toml"
   },
   "devDependencies": {
     "vitest": "^4.0.0",

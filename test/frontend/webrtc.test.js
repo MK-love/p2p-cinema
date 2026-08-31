@@ -3,8 +3,16 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { WebRTCClient, isScreenShareSupported, ICE_SERVERS } from '../../frontend/js/webrtc.js'
 
-function allStunUrls() {
+function allUrls() {
   return ICE_SERVERS.flatMap(s => Array.isArray(s.urls) ? s.urls : [s.urls])
+}
+
+function allStunUrls() {
+  return allUrls().filter(u => u.startsWith('stun:'))
+}
+
+function allTurnUrls() {
+  return allUrls().filter(u => u.startsWith('turn'))
 }
 
 describe('ICE 服务器配置', () => {
@@ -23,6 +31,15 @@ describe('ICE 服务器配置', () => {
 
   it('至少保留 2 台 STUN 服务器做冗余', () => {
     expect(allStunUrls().length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('配置了带凭据的 TURN 兜底（对称 NAT / 企业网场景）', () => {
+    expect(allTurnUrls().length).toBeGreaterThanOrEqual(2)
+    const turnEntries = ICE_SERVERS.filter(s => String(s.urls).startsWith('turn'))
+    for (const s of turnEntries) {
+      expect(s.username).toBeTruthy()
+      expect(s.credential).toBeTruthy()
+    }
   })
 })
 

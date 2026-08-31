@@ -1,15 +1,32 @@
-// frontend/js/signal.js — 信令客户端（HTTP 轮询）
+// frontend/js/signal.js — 信令客户端（WebSocket，v2）
+//
+// v1 为 KV HTTP 轮询（500ms 一次 GET，按毫秒时间戳游标增量拉取）；v2 升级为
+// Durable Object WebSocket 推送：消息即时到达，无轮询游标 —— 从根上消除
+// 同毫秒/时钟回拨导致的丢消息问题（v1 "同房间互看不到对方"的根因）。
+//
+// 可靠性设计：
+//  - 连接建立前 send() 的消息进入队列，open 后统一 flush
+//  - join 广播由服务端在连接建立时自动发出（客户端无需补发）
+//  - 意外断连自动指数退避重连；从未成功连上且重试 3 次仍失败 → 判定房间
+//    不存在/已过期，触发 onTimeout；会话中掉线则持续重连（配合服务端
+//    join 自动广播实现握手自愈）
 
-const POLL_INTERVAL = 500
+const RECONNECT_BASE_MS = 500
+const RECONNECT_MAX_MS = 5000
+const MAX_INITIAL_ATTEMPTS = 3
 
 export class SignalClient {
   constructor(apiBase, roomCode, peerId) {
-    this.apiBase = apiBase
+    this.wsBase = apiBase.replace(/^http/, 'ws')
     this.roomCode = roomCode
     this.peerId = peerId
-    this.lastTs = 0
-    this.running = false
-    this.timerId = null
+    this.ws = null
+    this.queue = []
+    this.stopped = false
+    this.initialAttempts = 0
+    this.everConnected = false
+    this.reconnectTimer = null
+    this.backoffMs = RECONNECT_BASE_MS
     this.messageCallbacks = []
     this.timeoutCallbacks = []
     this.errorCallbacks = []
@@ -27,73 +44,114 @@ export class SignalClient {
     this.errorCallbacks.push(callback)
   }
 
-  // I1: 内部 try/catch，错误通过 onError 回调上报
-  async send(to, type, data) {
-    try {
-      const res = await fetch(`${this.apiBase}/api/signal/${this.roomCode}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: this.peerId, to, type, data })
-      })
-      if (!res.ok) {
-        this.errorCallbacks.forEach(cb => cb(new Error(`Signal send failed: ${res.status}`)))
+  // 连接未就绪时入队，open 后统一 flush；发送异常经 onError 上报
+  send(to, type, data) {
+    const payload = JSON.stringify({ from: this.peerId, to, type, data })
+    if (this.ws && this.ws.readyState === 1) {
+      try {
+        this.ws.send(payload)
+      } catch (e) {
+        this.errorCallbacks.forEach(cb => cb(e))
       }
-    } catch (e) {
-      this.errorCallbacks.forEach(cb => cb(e))
+    } else {
+      this.queue.push(payload)
     }
   }
 
   start() {
-    this.running = true
-    this.poll()
+    if (this.ws) return
+    this.stopped = false
+    this.connect()
   }
 
-  // I10: 重连时恢复轮询
+  // I10: 对外恢复入口 — WS 存活时为 no-op，已断开且未被手动停止时立即重连
   reset() {
-    this.running = true
-    if (!this.timerId) {
-      this.poll()
+    if (!this.ws && !this.stopped) {
+      this.connect()
     }
   }
 
   // I2: 停止时清空回调，防止重复注册
   stop() {
-    this.running = false
-    if (this.timerId) {
-      clearTimeout(this.timerId)
-      this.timerId = null
+    this.stopped = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.ws) {
+      const ws = this.ws
+      this.ws = null
+      try {
+        ws.close(1000)
+      } catch {}
     }
     this.messageCallbacks = []
     this.timeoutCallbacks = []
     this.errorCallbacks = []
   }
 
-  async poll() {
-    if (!this.running) return
-
+  connect() {
+    if (this.stopped) return
+    const url = `${this.wsBase}/api/signal/${this.roomCode}?peerId=${encodeURIComponent(this.peerId)}`
+    let ws
     try {
-      const res = await fetch(`${this.apiBase}/api/signal/${this.roomCode}?since=${this.lastTs}`)
-      if (res.status === 404) {
-        // 房间不存在或已过期 — 信令通道随房间生命周期结束
-        this.timeoutCallbacks.forEach(cb => cb())
-        this.stop()
-        return
+      ws = new WebSocket(url)
+    } catch (e) {
+      this.errorCallbacks.forEach(cb => cb(e))
+      this.scheduleReconnect()
+      return
+    }
+    this.ws = ws
+
+    ws.onopen = () => {
+      this.everConnected = true
+      this.initialAttempts = 0
+      this.backoffMs = RECONNECT_BASE_MS
+      const pending = this.queue.splice(0)
+      for (const payload of pending) {
+        try {
+          ws.send(payload)
+        } catch {}
       }
-      if (res.ok) {
-        const { messages } = await res.json()
-        for (const msg of messages) {
-          if (msg.to === this.peerId) {
-            this.messageCallbacks.forEach(cb => cb(msg))
-          }
-          if (msg.ts > this.lastTs) this.lastTs = msg.ts
+    }
+
+    ws.onmessage = (event) => {
+      let msg
+      try {
+        msg = JSON.parse(event.data)
+      } catch {
+        return // 忽略无法解析的帧
+      }
+      if (!msg || typeof msg.type !== 'string') return
+      if (msg.to === this.peerId) {
+        this.messageCallbacks.forEach(cb => cb(msg))
+      }
+    }
+
+    ws.onclose = () => {
+      if (this.ws !== ws) return // 已被 stop() 或新连接取代
+      this.ws = null
+      if (this.stopped) return
+
+      if (!this.everConnected) {
+        this.initialAttempts++
+        if (this.initialAttempts >= MAX_INITIAL_ATTEMPTS) {
+          // 从未连上：房间不存在或已过期 — 信令通道随房间生命周期结束
+          this.timeoutCallbacks.forEach(cb => cb())
+          this.stop()
+          return
         }
       }
-    } catch (e) {
-      // 网络错误，继续重试
+      this.scheduleReconnect()
     }
+  }
 
-    if (this.running) {
-      this.timerId = setTimeout(() => this.poll(), POLL_INTERVAL)
-    }
+  scheduleReconnect() {
+    if (this.reconnectTimer || this.stopped) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, this.backoffMs)
+    this.backoffMs = Math.min(this.backoffMs * 2, RECONNECT_MAX_MS)
   }
 }

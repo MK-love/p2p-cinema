@@ -7,14 +7,13 @@ compatibility_date = "2024-01-01"
 directory = "../frontend"
 run_worker_first = ["/api/*"]
 
-# 部署前替换为真实 KV Namespace ID
-# 创建方式: Cloudflare Dashboard → Workers & Pages → KV → Create Namespace
-# 创建两个 namespace: p2p-cinema-rooms 和 p2p-cinema-signals
-# 然后将下方 id 替换为各自的 namespace ID
-[[kv_namespaces]]
-binding = "ROOMS"
-id = "5f67fff67d864b61997c720a62090080"
+# v2：房间状态 + 信令全部收敛进 Durable Object（SQLite 存储）
+# 免费套餐（Workers Free）即可使用 —— SQLite 存储类 DO 是免费计划支持的形态
+# （key-value 存储 DO 需要付费计划，因此必须用 new_sqlite_classes）
+# KV 已完全移除：部署不再需要创建 KV namespace 或回填任何 id（零配置）
+[durable_objects]
+bindings = [{ name = "ROOMS", class_name = "RoomSignalDO" }]
 
-[[kv_namespaces]]
-binding = "SIGNALS"
-id = "fc595fcbbf594992befee61cd7ae5039"
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomSignalDO"]

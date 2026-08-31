@@ -5,7 +5,13 @@ export const ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.miwifi.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' }
+  { urls: 'stun:stun1.l.google.com:19302' },
+  // 免费 TURN（Open Relay 公共服务）：对称 NAT / 企业网 / 蜂窝网络下 STUN
+  // 打洞失败时的兜底中继 —— 没有 TURN 这类网络组合永远连不上（P2P 免费方案
+  // 的最后一环）。演示级公共服务；生产可替换为自建 coturn 或 Cloudflare Calls TURN。
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
 ]
 
 const MAX_RECONNECT_ATTEMPTS = 3
@@ -161,6 +167,13 @@ export class WebRTCClient {
 
   // I1: await send
   async initiateConnection(remotePeerId) {
+    // 对端断线重连时服务端会再次广播 join：先关闭旧连接重建，
+    // 避免连接泄漏 / 残留半开 pc（DataChannel 残留会导致消息发往死通道）
+    const existing = this.connections.get(remotePeerId)
+    if (existing) {
+      this.connections.delete(remotePeerId)
+      existing.close()
+    }
     const pc = this.createConnection(remotePeerId)
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)

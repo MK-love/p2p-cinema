@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>运行中…</title>
+</head>
+<body>
+<h3>p2p-cinema v2 浏览器冒烟测试（无 shell 环境备用）</h3>
+<pre id="out">booting…</pre>
+
+<!-- ============ 内联源码（与仓库当前版本保持一致） ============ -->
+<script type="text/plain" id="src-worker">
+// worker/src/index.js — Cloudflare Worker + Durable Object 信令服务（v2，WebSocket）
+//
+// v2 架构（全免费套餐）：
+//  - 房间状态与信令全部收敛进单个 Durable Object（SQLite 存储，免费套餐可用）
+//  - 信令从 KV HTTP 轮询升级为 WebSocket 推送：DO 天然串行化（强一致，
+//    无并发丢更新）、消息即时到达（无 500ms 轮询间隔）、零 KV 配额消耗
+//  - KV 完全移除：部署不再需要手工创建 KV namespace 并回填 id（零配置）
+//
+// v1 → v2 动机：KV 是最终一致存储，跨节点传播可达 60s；"读-改-写"追加消息
+// 存在并发丢更新；毫秒时间戳游标在同毫秒/时钟回拨时会永久丢消息（曾导致
+// "同房间互看不到对方"）。DO 每房间单实例串行处理，从根上消除这类竞态。
+//
+// 对外 API（与 v1 兼容）：
+//  POST   /api/room            创建房间 → { roomCode, peerId } 201
+//  GET    /api/room/:code      查询房间 → { hostId, participants }
+//  DELETE /api/room/:code      解散房间（仅房主）
+//  GET    /api/signal/:code?peerId=...   WebSocket 升级（信令通道）
+//
+// WebSocket 消息格式（客户端 → 服务端）：{ from, to, type, data }
+// 服务端按 to 精确转发（to: '*' 广播给其他人）；连接建立/断开时服务端自动
+// 广播 join / peer-left，房主据此发起或回收 WebRTC 连接（断线自愈）。
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type'
+}
+
+const ROOM_TTL_MS = 60 * 60 * 1000 // 空房间 1 小时后由 alarm 清理
+const CREATE_RETRIES = 5 // 房间码碰撞换码重试次数
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS }
+  })
+}
+
+function withCors(res) {
+  const headers = new Headers(res.headers)
+  for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v)
+  return new Response(res.body, { status: res.status, headers })
+}
+
+function generateRoomCode() {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+  let code = ''
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)]
+  }
+  return code
+}
+
+function validatePeerId(peerId) {
+  return typeof peerId === 'string' && peerId.length > 0 && peerId.length <= 100
+}
+
+function serializeSignal(from, to, type, data) {
+  return JSON.stringify({ from, to, type, data })
+}
+
+// ---------------------------------------------------------------------------
+// Durable Object：单房间状态机（房间元数据 + WebSocket 信令交换）
+// ---------------------------------------------------------------------------
+
+class RoomSignalDO {
+  constructor(state, env) {
+    this.state = state
+    this.env = env
+  }
+
+  // WebSocket 休眠后重入时从 attachment 恢复该连接的 peerId
+  #peerIdOf(ws) {
+    try {
+      const att = ws.deserializeAttachment?.()
+      return att?.peerId ?? null
+    } catch {
+      return null
+    }
+  }
+
+  async #room() {
+    return this.state.storage.get('room')
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url)
+
+    // POST /create?code=XXX {peerId} — 创建房间；同码已存在 → 409 供上层换码重试
+    if (url.pathname === '/create' && request.method === 'POST') {
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400)
+      }
+      if (!validatePeerId(body.peerId)) {
+        return jsonResponse({ error: 'Invalid peerId' }, 400)
+      }
+      if (await this.#room()) {
+        return jsonResponse({ error: 'Room code collision' }, 409)
+      }
+      const room = {
+        hostId: body.peerId,
+        createdAt: Date.now(),
+        participants: [body.peerId]
+      }
+      await this.state.storage.put('room', room)
+      await this.state.storage.setAlarm(Date.now() + ROOM_TTL_MS)
+      const roomCode = url.searchParams.get('code') || ''
+      return jsonResponse({ roomCode, peerId: body.peerId }, 201)
+    }
+
+    // GET /info — 房间信息
+    if (url.pathname === '/info' && request.method === 'GET') {
+      const room = await this.#room()
+      if (!room) return jsonResponse({ error: 'Room not found or expired' }, 404)
+      return jsonResponse({ hostId: room.hostId, participants: room.participants })
+    }
+
+    // POST /delete {peerId} — 解散房间（仅房主）：通知所有人 → 关闭连接 → 清空存储
+    if (url.pathname === '/delete' && request.method === 'POST') {
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400)
+      }
+      const room = await this.#room()
+      if (!room) return jsonResponse({ error: 'Room not found or expired' }, 404)
+      if (!validatePeerId(body?.peerId) || body.peerId !== room.hostId) {
+        return jsonResponse({ error: 'Only host can delete room' }, 403)
+      }
+      for (const ws of this.state.getWebSockets()) {
+        const to = this.#peerIdOf(ws)
+        if (!to) continue
+        try {
+          ws.send(serializeSignal(room.hostId, to, 'room-dissolved', null))
+        } catch {}
+      }
+      for (const ws of this.state.getWebSockets()) {
+        try {
+          ws.close(1000, 'room dissolved')
+        } catch {}
+      }
+      await this.state.storage.deleteAll()
+      return jsonResponse({ ok: true })
+    }
+
+    // GET /ws?peerId=... — WebSocket 接入
+    if (url.pathname === '/ws') {
+      if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket') {
+        return jsonResponse({ error: 'WebSocket required' }, 426)
+      }
+      const peerId = url.searchParams.get('peerId') || ''
+      if (!validatePeerId(peerId)) {
+        return jsonResponse({ error: 'Invalid peerId' }, 400)
+      }
+      const room = await this.#room()
+      if (!room) return jsonResponse({ error: 'Room not found or expired' }, 404)
+
+      const pair = new WebSocketPair()
+      const [client, server] = [pair[0], pair[1]]
+      try {
+        server.serializeAttachment?.({ peerId })
+      } catch {}
+      // Hibernation API：空闲期不占 CPU 时长（免费额度友好）
+      this.state.acceptWebSocket(server)
+      await this.state.storage.setAlarm(Date.now() + ROOM_TTL_MS)
+
+      // 自动广播 join：房主收到后主动发起 WebRTC 连接；
+      // 对端断线重连时同样触发 → 握手自愈（无需客户端补发 join）
+      for (const other of this.state.getWebSockets()) {
+        if (other === server) continue
+        const to = this.#peerIdOf(other)
+        if (!to) continue
+        try {
+          other.send(serializeSignal(peerId, to, 'join', peerId))
+        } catch {}
+      }
+      return new Response(client, { status: 101 })
+    }
+
+    return jsonResponse({ error: 'Not found' }, 404)
+  }
+
+  // --- WebSocket Hibernation 处理器 ---
+
+  async webSocketMessage(ws, message) {
+    let msg
+    try {
+      msg = JSON.parse(message)
+    } catch {
+      return // 忽略无法解析的帧
+    }
+    if (!msg || typeof msg.to !== 'string' || typeof msg.type !== 'string' || msg.type.length === 0) {
+      return
+    }
+    const from = this.#peerIdOf(ws) ?? (typeof msg.from === 'string' ? msg.from : '')
+    if (!from) return
+    await this.state.storage.setAlarm(Date.now() + ROOM_TTL_MS)
+
+    const payload = serializeSignal(from, msg.to, msg.type, msg.data ?? null)
+    for (const target of this.state.getWebSockets()) {
+      if (target === ws) continue
+      const targetId = this.#peerIdOf(target)
+      if (!targetId) continue
+      if (msg.to === '*' || targetId === msg.to) {
+        try {
+          target.send(payload)
+        } catch {}
+      }
+    }
+  }
+
+  async webSocketClose(ws) {
+    const from = this.#peerIdOf(ws)
+    if (!from) return
+    // 即时广播 peer-left：比 DataChannel 通知与重连超时更快，房主可秒级移除成员
+    for (const other of this.state.getWebSockets()) {
+      if (other === ws) continue
+      const to = this.#peerIdOf(other)
+      if (!to) continue
+      try {
+        other.send(serializeSignal(from, to, 'peer-left', from))
+      } catch {}
+    }
+  }
+
+  async alarm() {
+    // 空房间（无存活连接）到期清理；仍有观众在线则续期
+    if (this.state.getWebSockets().length > 0) {
+      await this.state.storage.setAlarm(Date.now() + ROOM_TTL_MS)
+    } else {
+      await this.state.storage.deleteAll()
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Worker 路由：/api/* → 转发到以房间码命名的 Durable Object
+// ---------------------------------------------------------------------------
+
+const __worker_default = {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS })
+    }
+
+    const url = new URL(request.url)
+    const parts = url.pathname.split('/').filter(Boolean)
+
+    if (parts[0] !== 'api') {
+      return jsonResponse({ error: 'Not found' }, 404)
+    }
+
+    // POST /api/room — 创建房间（碰撞换码重试，全部碰撞 → 503，绝不覆盖已有房间）
+    if (parts[1] === 'room' && !parts[2] && request.method === 'POST') {
+      const bodyText = await request.text() // body 只能读一次，重试复用文本
+      for (let i = 0; i < CREATE_RETRIES; i++) {
+        const code = generateRoomCode()
+        const stub = env.ROOMS.get(env.ROOMS.idFromName(code))
+        const res = await stub.fetch(`https://do/create?code=${code}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: bodyText
+        })
+        if (res.status !== 409) return withCors(res) // 201 或 400 直接透传
+      }
+      return jsonResponse({ error: 'Room code collision, please retry' }, 503)
+    }
+
+    // GET /api/room/:code | DELETE /api/room/:code — 查询 / 解散
+    if (parts[1] === 'room' && parts[2] && (request.method === 'GET' || request.method === 'DELETE')) {
+      const stub = env.ROOMS.get(env.ROOMS.idFromName(parts[2]))
+      const init =
+        request.method === 'GET'
+          ? { method: 'GET' }
+          : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: await request.text() }
+      const res = await stub.fetch(`https://do/${request.method === 'GET' ? 'info' : 'delete'}`, init)
+      return withCors(res)
+    }
+
+    // GET /api/signal/:code?peerId=... — WebSocket 升级透传（101 原样返回）
+    if (parts[1] === 'signal' && parts[2] && request.method === 'GET') {
+      const stub = env.ROOMS.get(env.ROOMS.idFromName(parts[2]))
+      return stub.fetch(new Request(`https://do/ws${url.search}`, request))
+    }
+
+    return jsonResponse({ error: 'Not found' }, 404)
+  }
+}
+</script>
+
+<script type="text/plain" id="src-signal">
+// frontend/js/signal.js — 信令客户端（WebSocket，v2）
+//
+// v1 为 KV HTTP 轮询（500ms 一次 GET，按毫秒时间戳游标增量拉取）；v2 升级为
+// Durable Object WebSocket 推送：消息即时到达，无轮询游标 —— 从根上消除
+// 同毫秒/时钟回拨导致的丢消息问题（v1 "同房间互看不到对方"的根因）。
+//
+// 可靠性设计：
+//  - 连接建立前 send() 的消息进入队列，open 后统一 flush
+//  - join 广播由服务端在连接建立时自动发出（客户端无需补发）
+//  - 意外断连自动指数退避重连；从未成功连上且重试 3 次仍失败 → 判定房间
+//    不存在/已过期，触发 onTimeout；会话中掉线则持续重连（配合服务端
+//    join 自动广播实现握手自愈）
+
+const RECONNECT_BASE_MS = 500
+const RECONNECT_MAX_MS = 5000
+const MAX_INITIAL_ATTEMPTS = 3
+
+class SignalClient {
+  constructor(apiBase, roomCode, peerId) {
+    this.wsBase = apiBase.replace(/^http/, 'ws')
+    this.roomCode = roomCode
+    this.peerId = peerId
+    this.ws = null
+    this.queue = []
+    this.stopped = false
+    this.initialAttempts = 0
+    this.everConnected = false
+    this.reconnectTimer = null
+    this.backoffMs = RECONNECT_BASE_MS
+    this.messageCallbacks = []
+    this.timeoutCallbacks = []
+    this.errorCallbacks = []
+  }
+
+  onMessage(callback) {
+    this.messageCallbacks.push(callback)
+  }
+
+  onTimeout(callback) {
+    this.timeoutCallbacks.push(callback)
+  }
+
+  onError(callback) {
+    this.errorCallbacks.push(callback)
+  }
+
+  // 连接未就绪时入队，open 后统一 flush；发送异常经 onError 上报
+  send(to, type, data) {
+    const payload = JSON.stringify({ from: this.peerId, to, type, data })
+    if (this.ws && this.ws.readyState === 1) {
+      try {
+        this.ws.send(payload)
+      } catch (e) {
+        this.errorCallbacks.forEach(cb => cb(e))
+      }
+    } else {
+      this.queue.push(payload)
+    }
+  }
+
+  start() {
+    if (this.ws) return
+    this.stopped = false
+    this.connect()
+  }
+
+  // I10: 对外恢复入口 — WS 存活时为 no-op，已断开且未被手动停止时立即重连
+  reset() {
+    if (!this.ws && !this.stopped) {
+      this.connect()
+    }
+  }
+
+  // I2: 停止时清空回调，防止重复注册
+  stop() {
+    this.stopped = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.ws) {
+      const ws = this.ws
+      this.ws = null
+      try {
+        ws.close(1000)
+      } catch {}
+    }
+    this.messageCallbacks = []
+    this.timeoutCallbacks = []
+    this.errorCallbacks = []
+  }
+
+  connect() {
+    if (this.stopped) return
+    const url = `${this.wsBase}/api/signal/${this.roomCode}?peerId=${encodeURIComponent(this.peerId)}`
+    let ws
+    try {
+      ws = new WebSocket(url)
+    } catch (e) {
+      this.errorCallbacks.forEach(cb => cb(e))
+      this.scheduleReconnect()
+      return
+    }
+    this.ws = ws
+
+    ws.onopen = () => {
+      this.everConnected = true
+      this.initialAttempts = 0
+      this.backoffMs = RECONNECT_BASE_MS
+      const pending = this.queue.splice(0)
+      for (const payload of pending) {
+        try {
+          ws.send(payload)
+        } catch {}
+      }
+    }
+
+    ws.onmessage = (event) => {
+      let msg
+      try {
+        msg = JSON.parse(event.data)
+      } catch {
+        return // 忽略无法解析的帧
+      }
+      if (!msg || typeof msg.type !== 'string') return
+      if (msg.to === this.peerId) {
+        this.messageCallbacks.forEach(cb => cb(msg))
+      }
+    }
+
+    ws.onclose = () => {
+      if (this.ws !== ws) return // 已被 stop() 或新连接取代
+      this.ws = null
+      if (this.stopped) return
+
+      if (!this.everConnected) {
+        this.initialAttempts++
+        if (this.initialAttempts >= MAX_INITIAL_ATTEMPTS) {
+          // 从未连上：房间不存在或已过期 — 信令通道随房间生命周期结束
+          this.timeoutCallbacks.forEach(cb => cb())
+          this.stop()
+          return
+        }
+      }
+      this.scheduleReconnect()
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer || this.stopped) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, this.backoffMs)
+    this.backoffMs = Math.min(this.backoffMs * 2, RECONNECT_MAX_MS)
+  }
+}
+</script>
+
+<script type="text/plain" id="src-webrtc">
+// frontend/js/webrtc.js（节选：ICE 配置与能力检测，第 1-22 行）
+const ICE_SERVERS = [
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:stun.miwifi.com:3478' },
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+]
+
+function isScreenShareSupported() {
+  return typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia
+}
+</script>
+
+<!-- ============ 测试执行器 ============ -->
+<script>
+(function () {
+  const out = document.getElementById('out')
+  const lines = []
+  let passed = 0
+  let failed = 0
+
+  function log(line) {
+    lines.push(line)
+    out.textContent = lines.join('\n')
+  }
+
+  function assert(cond, msg) {
+    if (!cond) throw new Error(msg || 'assertion failed')
+  }
+
+  function assertEq(actual, expected, msg) {
+    if (actual !== expected) {
+      throw new Error((msg || '') + ` — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
+    }
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  async function test(name, fn) {
+    try {
+      await fn()
+      passed++
+      log('PASS  ' + name)
+    } catch (e) {
+      failed++
+      log('FAIL  ' + name + '  ::  ' + (e && e.message ? e.message : String(e)))
+    }
+  }
+
+  // --- 加载内联模块（去 export，Function 求值） ---
+  function loadSource(id) {
+    return document.getElementById(id).textContent
+  }
+
+  const workerMod = new Function(
+    loadSource('src-worker') + '\n;return { worker: __worker_default, RoomSignalDO }'
+  )()
+  const signalMod = new Function(loadSource('src-signal') + '\n;return { SignalClient }')()
+  const webrtcMod = new Function(loadSource('src-webrtc') + '\n;return { ICE_SERVERS, isScreenShareSupported }')()
+
+  const { worker, RoomSignalDO } = workerMod
+  const { SignalClient } = signalMod
+  const { ICE_SERVERS, isScreenShareSupported } = webrtcMod
+
+  // --- mock Durable Object 基础设施（与 test/worker/index.test.js 一致） ---
+  function createDOState() {
+    const data = new Map()
+    const accepted = []
+    let alarmTime = null
+    return {
+      storage: {
+        get: async (k) => (data.has(k) ? JSON.parse(JSON.stringify(data.get(k))) : null),
+        put: async (k, v) => { data.set(k, JSON.parse(JSON.stringify(v))) },
+        delete: async (k) => { data.delete(k) },
+        deleteAll: async () => { data.clear() },
+        setAlarm: async (t) => { alarmTime = t },
+        getAlarm: async () => alarmTime
+      },
+      acceptWebSocket: (ws) => { accepted.push(ws) },
+      getWebSockets: () => accepted.filter((ws) => !ws.closed),
+      _data: data,
+      _accepted: accepted,
+      _alarm: () => alarmTime
+    }
+  }
+
+  function makeSocket(peerId) {
+    return {
+      peerId,
+      closed: false,
+      sent: [],
+      _att: null,
+      serializeAttachment(value) { this._att = value },
+      deserializeAttachment() { return this._att ?? { peerId: this.peerId } },
+      send(data) { this.sent.push(data) },
+      close() { this.closed = true }
+    }
+  }
+
+  function createEnv() {
+    const instances = new Map()
+    return {
+      ROOMS: {
+        idFromName: (name) => ({ name }),
+        // 真实 stub 支持 fetch(url, init) 签名；DO 实例只吃 Request —— 包一层适配
+        get: (id) => {
+          if (!instances.has(id.name)) {
+            instances.set(id.name, new RoomSignalDO(createDOState(), {}))
+          }
+          const doInstance = instances.get(id.name)
+          return {
+            fetch: (input, init) =>
+              doInstance.fetch(typeof input === 'string' ? new Request(input, init) : input)
+          }
+        },
+        _instances: instances
+      }
+    }
+  }
+
+  function jsonRequest(method, path, body) {
+    return new Request('http://localhost' + path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined
+    })
+  }
+
+  // --- FakeWebSocket（与 test/frontend/signal.test.js 一致） ---
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url
+      this.readyState = 0
+      this.sent = []
+      this.closed = false
+      FakeWebSocket.instances.push(this)
+    }
+    send(data) { this.sent.push(data) }
+    close(code = 1000) {
+      if (this.closed) return
+      this.closed = true
+      this.readyState = 3
+      if (this.onclose) this.onclose({ code })
+    }
+    simulateOpen() {
+      this.readyState = 1
+      if (this.onopen) this.onopen()
+    }
+    simulateMessage(obj) {
+      if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) })
+    }
+    simulateClose(code = 1006) {
+      if (this.closed) return
+      this.closed = true
+      this.readyState = 3
+      if (this.onclose) this.onclose({ code })
+    }
+  }
+  FakeWebSocket.instances = []
+
+  async function run() {
+    log('== Worker REST API ==')
+
+    await test('OPTIONS 预检返回 204 + CORS 头', async () => {
+      const env = createEnv()
+      const res = await worker.fetch(new Request('http://localhost/api/room', { method: 'OPTIONS' }), env)
+      assertEq(res.status, 204, 'status')
+      assertEq(res.headers.get('Access-Control-Allow-Origin'), '*', 'ACAO')
+    })
+
+    await test('POST /api/room 创建房间 → 201 + 6 位房间码', async () => {
+      const env = createEnv()
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      assertEq(res.status, 201, 'status')
+      const data = await res.json()
+      assert(data.roomCode.length === 6, 'roomCode 应为 6 位')
+      assertEq(data.peerId, 'host-123', 'peerId')
+    })
+
+    await test('POST /api/room 缺 peerId → 400', async () => {
+      const env = createEnv()
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', {}), env)
+      assertEq(res.status, 400, 'status')
+    })
+
+    await test('POST /api/room 空 peerId → 400', async () => {
+      const env = createEnv()
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: '' }), env)
+      assertEq(res.status, 400, 'status')
+    })
+
+    await test('房间码恒碰撞 → 503 且换码重试恰 5 次（不覆盖他人房间）', async () => {
+      const env = createEnv()
+      let createAttempts = 0
+      env.ROOMS.get = () => ({
+        fetch: async () => {
+          createAttempts++
+          return new Response(JSON.stringify({ error: 'Room code collision' }), {
+            status: 409,
+            headers: { 'Content-Type': 'application/json' }
+          })
+        }
+      })
+      const res = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      assertEq(res.status, 503, 'status')
+      assertEq(createAttempts, 5, '重试次数')
+    })
+
+    await test('GET /api/room/:code → 200 + hostId', async () => {
+      const env = createEnv()
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(new Request('http://localhost/api/room/' + roomCode), env)
+      assertEq(res.status, 200, 'status')
+      const data = await res.json()
+      assertEq(data.hostId, 'host-123', 'hostId')
+    })
+
+    await test('GET /api/room/INVALID → 404', async () => {
+      const env = createEnv()
+      const res = await worker.fetch(new Request('http://localhost/api/room/INVALID'), env)
+      assertEq(res.status, 404, 'status')
+    })
+
+    await test('DELETE 房主解散 → 200 + 房间消失', async () => {
+      const env = createEnv()
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(jsonRequest('DELETE', '/api/room/' + roomCode, { peerId: 'host-123' }), env)
+      assertEq(res.status, 200, 'status')
+      const data = await res.json()
+      assertEq(data.ok, true, 'ok')
+      const getRes = await worker.fetch(new Request('http://localhost/api/room/' + roomCode), env)
+      assertEq(getRes.status, 404, '删除后应 404')
+    })
+
+    await test('DELETE 非房主 → 403 且房间仍在', async () => {
+      const env = createEnv()
+      const createRes = await worker.fetch(jsonRequest('POST', '/api/room', { peerId: 'host-123' }), env)
+      const { roomCode } = await createRes.json()
+      const res = await worker.fetch(jsonRequest('DELETE', '/api/room/' + roomCode, { peerId: 'guest-456' }), env)
+      assertEq(res.status, 403, 'status')
+      const getRes = await worker.fetch(new Request('http://localhost/api/room/' + roomCode), env)
+      assertEq(getRes.status, 200, '房间应仍在')
+    })
+
+    await test('DELETE 不存在的房间 → 404', async () => {
+      const env = createEnv()
+      const res = await worker.fetch(jsonRequest('DELETE', '/api/room/INVALID', { peerId: 'host-123' }), env)
+      assertEq(res.status, 404, 'status')
+    })
+
+    log('')
+    log('== RoomSignalDO 状态机 ==')
+
+    await test('/create 同码房间 → 409（碰撞由上层换码）', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      const req = (code) => new Request('https://do/create?code=' + code, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId: 'host-1' })
+      })
+      assertEq((await roomDO.fetch(req('ABC234'))).status, 201, '首次应 201')
+      assertEq((await roomDO.fetch(req('ABC234'))).status, 409, '重复应 409')
+    })
+
+    await test('解散：广播 room-dissolved（带正确 to）→ 关闭连接 → 清空存储', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      await roomDO.fetch(new Request('https://do/create?code=ABC234', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId: 'host-1' })
+      }))
+      const host = makeSocket('host-1')
+      const guest = makeSocket('guest-2')
+      host.serializeAttachment({ peerId: 'host-1' })
+      guest.serializeAttachment({ peerId: 'guest-2' })
+      state.acceptWebSocket(host)
+      state.acceptWebSocket(guest)
+
+      const res = await roomDO.fetch(new Request('https://do/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId: 'host-1' })
+      }))
+      assertEq(res.status, 200, 'status')
+      assert(host.closed, 'host socket 应关闭')
+      assert(guest.closed, 'guest socket 应关闭')
+      const notified = guest.sent.map((s) => JSON.parse(s)).find((m) => m.type === 'room-dissolved')
+      assert(notified, 'guest 应收到 room-dissolved')
+      assertEq(notified.to, 'guest-2', 'to 应为 guest-2')
+      assertEq(state._data.size, 0, '存储应清空')
+    })
+
+    await test('webSocketMessage：按 to 精确转发，不回发、不误发', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      const a = makeSocket('A')
+      const b = makeSocket('B')
+      const c = makeSocket('C')
+      state.acceptWebSocket(a)
+      state.acceptWebSocket(b)
+      state.acceptWebSocket(c)
+
+      await roomDO.webSocketMessage(a, JSON.stringify({ from: 'A', to: 'B', type: 'offer', data: 'sdp' }))
+      assertEq(b.sent.length, 1, 'B 应收到 1 条')
+      const msg = JSON.parse(b.sent[0])
+      assert(msg.from === 'A' && msg.to === 'B' && msg.type === 'offer' && msg.data === 'sdp', '字段应完整')
+      assertEq(a.sent.length, 0, 'A 不应收到自己的消息')
+      assertEq(c.sent.length, 0, 'C 不应收到')
+    })
+
+    await test('webSocketMessage：to "*" 广播给所有其他人', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      const a = makeSocket('A')
+      const b = makeSocket('B')
+      const c = makeSocket('C')
+      state.acceptWebSocket(a)
+      state.acceptWebSocket(b)
+      state.acceptWebSocket(c)
+
+      await roomDO.webSocketMessage(a, JSON.stringify({ from: 'A', to: '*', type: 'chat', data: 'hi' }))
+      assertEq(a.sent.length, 0, '发送者不收')
+      assertEq(b.sent.length, 1, 'B 收到')
+      assertEq(c.sent.length, 1, 'C 收到')
+    })
+
+    await test('webSocketMessage：忽略坏帧与非法消息（不抛错）', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      const b = makeSocket('B')
+      state.acceptWebSocket(b)
+      await roomDO.webSocketMessage(b, 'not-json{{{')
+      await roomDO.webSocketMessage(b, JSON.stringify({ nonsense: true }))
+      assertEq(b.sent.length, 0, '不应产生转发')
+    })
+
+    await test('webSocketClose：广播 peer-left（from 为断开者）', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      const host = makeSocket('host-1')
+      const guest = makeSocket('guest-2')
+      state.acceptWebSocket(host)
+      state.acceptWebSocket(guest)
+
+      guest.closed = true
+      await roomDO.webSocketClose(guest)
+      assertEq(host.sent.length, 1, 'host 应收到通知')
+      const msg = JSON.parse(host.sent[0])
+      assert(msg.from === 'guest-2' && msg.to === 'host-1' && msg.type === 'peer-left', '字段应正确')
+    })
+
+    await test('alarm：无连接 → 清空房间', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      state.storage.put('room', { hostId: 'host-1', createdAt: Date.now(), participants: ['host-1'] })
+      await roomDO.alarm()
+      assertEq(state._data.size, 0, '存储应清空')
+    })
+
+    await test('alarm：有存活连接 → 续期不清理', async () => {
+      const state = createDOState()
+      const roomDO = new RoomSignalDO(state, {})
+      state.storage.put('room', { hostId: 'host-1', createdAt: Date.now(), participants: ['host-1'] })
+      state.acceptWebSocket(makeSocket('guest-2'))
+      const before = state._alarm()
+      await roomDO.alarm()
+      assertEq(state._data.size, 1, '房间应保留')
+      assert(state._alarm() >= before, 'alarm 应被重设')
+    })
+
+    log('')
+    log('== SignalClient（WebSocket，真实定时器） ==')
+
+    const RealWebSocket = window.WebSocket
+    window.WebSocket = FakeWebSocket
+
+    await test('ws 地址派生：http→ws / https→wss + peerId 参数', async () => {
+      FakeWebSocket.instances.length = 0
+      const client = new SignalClient('http://localhost:8787', 'ABC234', 'peer-1')
+      client.start()
+      assertEq(FakeWebSocket.instances[0].url, 'ws://localhost:8787/api/signal/ABC234?peerId=peer-1', 'http 派生')
+      client.stop()
+      const secure = new SignalClient('https://cinema.example.com', 'ABC234', 'peer-1')
+      secure.start()
+      assertEq(FakeWebSocket.instances[1].url, 'wss://cinema.example.com/api/signal/ABC234?peerId=peer-1', 'https 派生')
+      secure.stop()
+    })
+
+    await test('未 open 时 send 入队，open 后 flush', async () => {
+      FakeWebSocket.instances.length = 0
+      const client = new SignalClient('http://test', 'ABC234', 'peer-1')
+      client.send('peer-2', 'offer', 'sdp')
+      client.start()
+      const ws = FakeWebSocket.instances[0]
+      assertEq(ws.sent.length, 0, 'open 前不应发送')
+      ws.simulateOpen()
+      assertEq(ws.sent.length, 1, 'open 后应 flush')
+      const msg = JSON.parse(ws.sent[0])
+      assert(msg.from === 'peer-1' && msg.to === 'peer-2' && msg.type === 'offer' && msg.data === 'sdp', '字段应完整')
+      client.send('peer-2', 'ice', 'cand')
+      assertEq(ws.sent.length, 2, 'open 后直发')
+      client.stop()
+    })
+
+    await test('只分发给 to === 自身 peerId 的消息', async () => {
+      FakeWebSocket.instances.length = 0
+      const client = new SignalClient('http://test', 'ABC234', 'peer-1')
+      const got = []
+      client.onMessage((m) => got.push(m))
+      client.start()
+      const ws = FakeWebSocket.instances[0]
+      ws.simulateOpen()
+      ws.simulateMessage({ from: 'peer-2', to: 'peer-1', type: 'offer', data: '{}' })
+      ws.simulateMessage({ from: 'peer-2', to: 'peer-3', type: 'ice', data: '{}' })
+      ws.simulateMessage({ from: 'peer-2', to: 'peer-1', type: 'peer-left', data: 'peer-2' })
+      assertEq(got.length, 2, '应收 2 条（过滤掉发给 peer-3 的）')
+      client.stop()
+    })
+
+    await test('从未连上 ×3 → onTimeout 一次并停止（房间不存在/过期）', async () => {
+      FakeWebSocket.instances.length = 0
+      const client = new SignalClient('http://test', 'ABC234', 'peer-1')
+      let timeouts = 0
+      client.onTimeout(() => timeouts++)
+      client.start()
+
+      FakeWebSocket.instances[0].simulateClose(1006)
+      await sleep(700)   // 退避 500ms → 第 2 次连接
+      assertEq(FakeWebSocket.instances.length, 2, '应已重连 1 次')
+      FakeWebSocket.instances[1].simulateClose(1006)
+      await sleep(1200)  // 退避 1000ms → 第 3 次连接
+      assertEq(FakeWebSocket.instances.length, 3, '应已重连 2 次')
+      FakeWebSocket.instances[2].simulateClose(1006)
+      assertEq(timeouts, 1, 'onTimeout 应触发 1 次')
+
+      const count = FakeWebSocket.instances.length
+      await sleep(1500)
+      assertEq(FakeWebSocket.instances.length, count, '停止后不应再连')
+    })
+
+    await test('会话中掉线自动重连', async () => {
+      FakeWebSocket.instances.length = 0
+      const client = new SignalClient('http://test', 'ABC234', 'peer-1')
+      client.start()
+      FakeWebSocket.instances[0].simulateOpen()
+      FakeWebSocket.instances[0].simulateClose(1006)
+      await sleep(700)
+      assertEq(FakeWebSocket.instances.length, 2, '应自动重连')
+      const ws2 = FakeWebSocket.instances[1]
+      ws2.simulateOpen()
+      client.send('peer-2', 'answer', 'sdp')
+      assertEq(ws2.sent.length, 1, '重连后可直发')
+      client.stop()
+    })
+
+    await test('stop() 幂等且断开不触发重连', async () => {
+      FakeWebSocket.instances.length = 0
+      const client = new SignalClient('http://test', 'ABC234', 'peer-1')
+      client.start()
+      FakeWebSocket.instances[0].simulateOpen()
+      client.stop()
+      client.stop()
+      FakeWebSocket.instances[0].simulateClose(1006)
+      await sleep(1200)
+      assertEq(FakeWebSocket.instances.length, 1, '不应产生新连接')
+    })
+
+    window.WebSocket = RealWebSocket
+
+    log('')
+    log('== WebRTC ICE 配置 ==')
+
+    await test('STUN >= 2 且含国内可达备用（Cloudflare/小米）', () => {
+      const urls = ICE_SERVERS.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]))
+      const stuns = urls.filter((u) => u.startsWith('stun:'))
+      assert(stuns.length >= 2, 'STUN 应 >= 2')
+      assert(
+        stuns.some((u) => u.includes('stun.cloudflare.com')) || stuns.some((u) => /miwifi/.test(u)),
+        '应含 Cloudflare 或小米 STUN'
+      )
+    })
+
+    await test('所有 STUN 地址格式合法', () => {
+      const stuns = ICE_SERVERS.flatMap((s) => (Array.isArray(s.urls) ? s.urls : [s.urls])).filter((u) => u.startsWith('stun:'))
+      for (const u of stuns) assert(/^stun:[a-z0-9.\-]+:\d+$/.test(u), 'STUN 格式: ' + u)
+    })
+
+    await test('TURN >= 2 且带 username/credential（对称 NAT 兜底）', () => {
+      const turns = ICE_SERVERS.filter((s) => String(s.urls).startsWith('turn'))
+      assert(turns.length >= 2, 'TURN 应 >= 2')
+      for (const s of turns) {
+        assert(s.username, 'username 缺失')
+        assert(s.credential, 'credential 缺失')
+      }
+    })
+
+    await test('isScreenShareSupported 返回布尔且与能力一致', () => {
+      const v = isScreenShareSupported()
+      assert(typeof v === 'boolean', '应为布尔')
+      assertEq(v, !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia), '与实际能力一致')
+    })
+
+    log('')
+    log('=============================')
+    log('SUMMARY: ' + passed + ' passed, ' + failed + ' failed')
+    document.title = failed === 0 ? 'ALL PASS (' + passed + ')' : 'FAILED (' + failed + ')'
+  }
+
+  run().catch((e) => {
+    failed++
+    log('HARNESS ERROR: ' + (e && e.stack ? e.stack : String(e)))
+    document.title = 'HARNESS ERROR'
+  })
+})()
+</script>
+</body>
+</html>
