@@ -131,12 +131,31 @@ HTTP `101` 升级（房间不存在返回 `404`）。连接后：
 | `ROOM_TTL_MS` | 3600000 | 空房间（无存活连接）回收时间；有连接时自动续期 | [worker/src/index.js](worker/src/index.js) |
 | `CREATE_RETRIES` | 5 | 房间码碰撞换码重试次数 | 同上 |
 
-### ICE 服务器（STUN + 免费 TURN）
+### ICE 服务器（STUN + TURN）
 
-- STUN（多路冗余，谁可达用谁）：`stun.cloudflare.com`、`stun.miwifi.com`（大陆可达）、`stun.l.google.com` ×2（境外）
-- TURN（Open Relay 免费公共服务，对称 NAT/企业网兜底）：`turn:openrelay.metered.ca:80/443`（凭据内置）
+- STUN（多路冗余，谁可达用谁）：`stun.cloudflare.com`、`stun.miwifi.com`、`stun.qq.com`（大陆可达）、`stun.l.google.com` ×2（境外）
+- 静态 TURN 兜底（Open Relay 免费公共服务）：`turn:openrelay.metered.ca:80/443`（大陆可达性差，推荐按下节替换为 Cloudflare TURN）
 
-修改位置：[frontend/js/webrtc.js](frontend/js/webrtc.js)。生产建议替换为自建 coturn 或 Cloudflare Calls TURN。
+修改位置：[frontend/js/webrtc.js](frontend/js/webrtc.js)。
+
+### TURN 中继（强烈推荐）：Cloudflare Calls TURN 动态凭据
+
+对称 NAT（蜂窝网络/部分家宽/企业网）下 STUN 打洞必然失败，必须有**可达的 TURN 中继**。内置的 Open Relay 在大陆基本超时，因此 v2 支持接入 **Cloudflare Calls TURN**（边缘覆盖好、免费额度内零成本）：前端进房时自动向 `/api/turn` 获取 1 小时时效的动态凭据。
+
+1. Cloudflare Dashboard → **Realtime (Calls)** → TURN → 创建 TURN Key，记录 **Key ID**
+2. 创建 API Token（权限：**Realtime (Calls) Edit**），记录 Token
+3. 配置三个 Secret 并重新部署：
+
+   ```bash
+   npx wrangler secret put CF_ACCOUNT_ID        # Dashboard 右侧边栏 Account ID
+   npx wrangler secret put CALLS_TURN_KEY_ID    # 第 1 步的 Key ID
+   npx wrangler secret put CALLS_TURN_API_TOKEN # 第 2 步的 Token
+   npm run deploy
+   ```
+
+4. 验证：`curl https://<你的域名>/api/turn` 返回 `{"enabled":true,"iceServers":{...}}` 即生效；未配置时返回 `{"enabled":false}`，前端自动回退静态 ICE，**不影响部署**。
+
+> 凭据 TTL 1 小时，每次进房重新获取；TURN 流量按 Cloudflare Calls 计费（免费额度后 $0.05/GB），仅在 STUN 打洞失败时使用。
 
 ## 成本估算
 
