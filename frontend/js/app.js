@@ -61,8 +61,10 @@ function switchSidebarTab(tab) {
 
 // 创建房间
 async function handleCreateRoom() {
-  // 防重复触发（双击/回车+点击会建立双 WS，导致重复 join 广播与信令竞态）
+  // 防重复触发：同步置位（await 间隙内第二次调用必须被挡住，
+  // 否则双 WS 会产生重复 join 广播与信令竞态）
   if (app.state !== 'home') return
+  app.state = 'joining'
   app.peerId = generatePeerId()
   app.nickname = $('input-nickname').value.trim() || generateNickname()
   app.isHost = true
@@ -76,19 +78,21 @@ async function handleCreateRoom() {
     app.signalClient.start()
     enterRoom()
   } catch (e) {
+    app.state = 'home' // 失败允许重试
     showToast('创建房间失败: ' + e.message)
   }
 }
 
 // 加入房间
 async function handleJoinRoom() {
-  // 防重复触发（双击/回车+点击会建立双 WS，导致重复 join 广播与信令竞态）
+  // 防重复触发：同步置位，与 handleCreateRoom 同理
   if (app.state !== 'home') return
   const code = $('input-room-code').value.trim().toUpperCase()
   if (code.length !== 6) {
     showToast('请输入 6 位邀请码')
     return
   }
+  app.state = 'joining'
   app.peerId = generatePeerId()
   app.nickname = $('input-nickname').value.trim() || generateNickname()
   app.isHost = false
@@ -104,6 +108,7 @@ async function handleJoinRoom() {
     app.signalClient.start()
     enterRoom()
   } catch (e) {
+    app.state = 'home' // 失败允许重试
     showToast(e.message)
   }
 }
